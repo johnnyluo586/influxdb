@@ -10,6 +10,7 @@
 - [#6334](https://github.com/influxdata/influxdb/pull/6334): Allow environment variables to be set per input type.
 - [#6394](https://github.com/influxdata/influxdb/pull/6394): Allow time math with integer timestamps.
 - [#3247](https://github.com/influxdata/influxdb/issues/3247): Implement derivatives across intervals for aggregate queries.
+- [#6290](https://github.com/influxdata/influxdb/issues/6290): Add POST /query endpoint and warning messages for using GET with write operations.
 
 ### Bugfixes
 
