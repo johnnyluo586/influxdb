@@ -279,7 +279,9 @@ def get_current_version():
     """
     version_tag = get_current_version_tag()
     # Remove leading 'v' and possible '-rc\d+'
-    version = re.sub(r'-rc\d+', '', str(version_tag[1:]))
+    if version_tag[0] == 'v':
+        version_tag = version_tag[1:]
+    version = re.sub(r'-rc\d+', '', str(version_tag))
     return version
 
 def get_current_rc():
@@ -925,7 +927,7 @@ if __name__ == '__main__':
                         help='Package binary output')
     parser.add_argument('--release',
                         action='store_true',
-                        help='Mark build output as release')    
+                        help='Mark build output as release')
     parser.add_argument('--clean',
                         action='store_true',
                         help='Clean output directory before building')
