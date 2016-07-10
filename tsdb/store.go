@@ -8,9 +8,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,10 +23,6 @@ var (
 	ErrShardNotFound = fmt.Errorf("shard not found")
 	// ErrStoreClosed gets returned when trying to use a closed Store.
 	ErrStoreClosed = fmt.Errorf("store is closed")
-)
-
-const (
-	maintenanceCheckInterval = time.Minute
 )
 
 // Store manages shards and indexes for databases.
@@ -42,6 +38,9 @@ type Store struct {
 	EngineOptions EngineOptions
 	Logger        *log.Logger
 
+	// logOutput is where output from the underlying databases will go.
+	logOutput io.Writer
+
 	closing chan struct{}
 	wg      sync.WaitGroup
 	opened  bool
@@ -51,13 +50,42 @@ type Store struct {
 // The returned store must be initialized by calling Open before using it.
 func NewStore(path string) *Store {
 	opts := NewEngineOptions()
-	opts.Config = NewConfig()
 
 	return &Store{
 		path:          path,
 		EngineOptions: opts,
 		Logger:        log.New(os.Stderr, "[store] ", log.LstdFlags),
+		logOutput:     os.Stderr,
 	}
+}
+
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Store) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[store] ", log.LstdFlags)
+	s.logOutput = w
+	for _, s := range s.shards {
+		s.SetLogOutput(w)
+	}
+}
+
+func (s *Store) Statistics(tags map[string]string) []models.Statistic {
+	var statistics []models.Statistic
+
+	s.mu.RLock()
+	indexes := make([]models.Statistic, 0, len(s.databaseIndexes))
+	for _, dbi := range s.databaseIndexes {
+		indexes = append(indexes, dbi.Statistics(tags)...)
+	}
+	shards := s.shardsSlice()
+	s.mu.RUnlock()
+
+	for _, shard := range shards {
+		statistics = append(statistics, shard.Statistics(tags)...)
+	}
+
+	statistics = append(statistics, indexes...)
+	return statistics
 }
 
 // Path returns the store's root path.
@@ -117,7 +145,7 @@ func (s *Store) loadShards() error {
 		err error
 	}
 
-	throttle := newthrottle(4)
+	throttle := newthrottle(runtime.GOMAXPROCS(0))
 
 	resC := make(chan *res)
 	var n int
@@ -158,6 +186,7 @@ func (s *Store) loadShards() error {
 					}
 
 					shard := NewShard(shardID, s.databaseIndexes[db], path, walPath, s.EngineOptions)
+					shard.SetLogOutput(s.logOutput)
 
 					err = shard.Open()
 					if err != nil {
@@ -248,7 +277,7 @@ func (s *Store) ShardN() int {
 }
 
 // CreateShard creates a shard with the given id and retention policy on a database.
-func (s *Store) CreateShard(database, retentionPolicy string, shardID uint64) error {
+func (s *Store) CreateShard(database, retentionPolicy string, shardID uint64, enabled bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -283,12 +312,36 @@ func (s *Store) CreateShard(database, retentionPolicy string, shardID uint64) er
 
 	path := filepath.Join(s.path, database, retentionPolicy, strconv.FormatUint(shardID, 10))
 	shard := NewShard(shardID, db, path, walPath, s.EngineOptions)
+	shard.SetLogOutput(s.logOutput)
+	shard.EnableOnOpen = enabled
+
 	if err := shard.Open(); err != nil {
 		return err
 	}
 
 	s.shards[shardID] = shard
 
+	return nil
+}
+
+// CreateShardSnapShot will create a hard link to the underlying shard and return a path
+// The caller is responsible for cleaning up (removing) the file path returned
+func (s *Store) CreateShardSnapshot(id uint64) (string, error) {
+	sh := s.Shard(id)
+	if sh == nil {
+		return "", ErrShardNotFound
+	}
+
+	return sh.CreateSnapshot()
+}
+
+// SetShardEnabled enables or disables a shard for read and writes
+func (s *Store) SetShardEnabled(shardID uint64, enabled bool) error {
+	sh := s.Shard(shardID)
+	if sh == nil {
+		return ErrShardNotFound
+	}
+	sh.SetEnabled(enabled)
 	return nil
 }
 
@@ -335,19 +388,41 @@ func (s *Store) ShardIteratorCreator(id uint64) influxql.IteratorCreator {
 
 // DeleteDatabase will close all shards associated with a database and remove the directory and files from disk.
 func (s *Store) DeleteDatabase(name string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	type resp struct {
+		shardID uint64
+		err     error
+	}
 
+	s.mu.RLock()
+	responses := make(chan resp, len(s.shards))
+	var wg sync.WaitGroup
 	// Close and delete all shards on the database.
 	for shardID, sh := range s.shards {
 		if sh.database == name {
-			// Delete the shard from disk.
-			if err := s.deleteShard(shardID); err != nil {
-				return err
-			}
+			wg.Add(1)
+			shardID, sh := shardID, sh // scoped copies of loop variables
+			go func() {
+				defer wg.Done()
+				err := sh.Close()
+				responses <- resp{shardID, err}
+			}()
 		}
 	}
+	s.mu.RUnlock()
+	wg.Wait()
+	close(responses)
 
+	for r := range responses {
+		if r.err != nil {
+			return r.err
+		}
+		s.mu.Lock()
+		delete(s.shards, r.shardID)
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := os.RemoveAll(filepath.Join(s.path, name)); err != nil {
 		return err
 	}
@@ -505,6 +580,22 @@ func (s *Store) BackupShard(id uint64, since time.Time, w io.Writer) error {
 	return shard.engine.Backup(w, path, since)
 }
 
+// RestoreShard restores a backup from r to a given shard.
+// This will only overwrite files included in the backup.
+func (s *Store) RestoreShard(id uint64, r io.Reader) error {
+	shard := s.Shard(id)
+	if shard == nil {
+		return fmt.Errorf("shard %d doesn't exist on this server", id)
+	}
+
+	path, err := relativePath(s.path, shard.path)
+	if err != nil {
+		return err
+	}
+
+	return shard.Restore(r, path)
+}
+
 // ShardRelativePath will return the relative path to the shard. i.e. <database>/<retention>/<id>
 func (s *Store) ShardRelativePath(id uint64) (string, error) {
 	shard := s.Shard(id)
@@ -524,6 +615,12 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 		return nil
 	}
 	sources = a
+
+	// Determine deletion time range.
+	min, max, err := influxql.TimeRangeAsEpochNano(condition)
+	if err != nil {
+		return err
+	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -557,7 +654,7 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 			// Check for unsupported field filters.
 			// Any remaining filters means there were fields (e.g., `WHERE value = 1.2`).
 			if filters.Len() > 0 {
-				return errors.New("DROP SERIES doesn't support fields in WHERE clause")
+				return errors.New("fields not supported in WHERE clause during deletion")
 			}
 		} else {
 			// No WHERE clause so get all series IDs for this measurement.
@@ -570,18 +667,16 @@ func (s *Store) DeleteSeries(database string, sources []influxql.Source, conditi
 	}
 
 	// delete the raw series data
-	if err := s.deleteSeries(database, seriesKeys); err != nil {
+	if err := s.deleteSeries(database, seriesKeys, min, max); err != nil {
 		return err
 	}
-
-	// remove them from the index
-	db.DropSeries(seriesKeys)
 
 	return nil
 }
 
-func (s *Store) deleteSeries(database string, seriesKeys []string) error {
-	if _, ok := s.databaseIndexes[database]; !ok {
+func (s *Store) deleteSeries(database string, seriesKeys []string, min, max int64) error {
+	db := s.databaseIndexes[database]
+	if db == nil {
 		return influxql.ErrDatabaseNotFound(database)
 	}
 
@@ -589,10 +684,24 @@ func (s *Store) deleteSeries(database string, seriesKeys []string) error {
 		if sh.database != database {
 			continue
 		}
-		if err := sh.DeleteSeries(seriesKeys); err != nil {
+		if err := sh.DeleteSeriesRange(seriesKeys, min, max); err != nil {
 			return err
 		}
+
+		// The keys we passed in may be fully deleted from the shard, if so,
+		// we need to remove the shard from all the meta data indexes
+		existing, err := sh.ContainsSeries(seriesKeys)
+		if err != nil {
+			return err
+		}
+
+		for k, exists := range existing {
+			if !exists {
+				db.UnassignShard(k, sh.id)
+			}
+		}
 	}
+
 	return nil
 }
 
@@ -603,8 +712,8 @@ func (s *Store) ExpandSources(sources influxql.Sources) (influxql.Sources, error
 
 // IteratorCreators returns a set of all local shards as iterator creators.
 func (s *Store) IteratorCreators() influxql.IteratorCreators {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 
 	a := make(influxql.IteratorCreators, 0, len(s.shards))
 	for _, sh := range s.shards {
@@ -613,7 +722,7 @@ func (s *Store) IteratorCreators() influxql.IteratorCreators {
 	return a
 }
 
-func (s *Store) IteratorCreator(shards []uint64) (influxql.IteratorCreator, error) {
+func (s *Store) IteratorCreator(shards []uint64, opt *influxql.SelectOptions) (influxql.IteratorCreator, error) {
 	// Generate iterators for each node.
 	ics := make([]influxql.IteratorCreator, 0)
 	if err := func() error {
@@ -682,18 +791,6 @@ func (e *Store) filterShowSeriesResult(limit, offset int, rows models.Rows) mode
 		}
 	}
 	return filteredSeries
-}
-
-// IsRetryable returns true if this error is temporary and could be retried
-func IsRetryable(err error) bool {
-	if err == nil {
-		return true
-	}
-
-	if strings.Contains(err.Error(), "field type conflict") {
-		return false
-	}
-	return true
 }
 
 // DecodeStorePath extracts the database and retention policy names

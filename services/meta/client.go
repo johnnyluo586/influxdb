@@ -24,14 +24,6 @@ import (
 )
 
 const (
-	// errSleep is the time to sleep after we've failed on every metaserver
-	// before making another pass
-	errSleep = time.Second
-
-	// maxRetries is the maximum number of attemps to make before returning
-	// a failure to the caller
-	maxRetries = 10
-
 	// SaltBytes is the number of bytes used for salts
 	SaltBytes = 32
 
@@ -74,12 +66,13 @@ type authUser struct {
 func NewClient(config *Config) *Client {
 	return &Client{
 		cacheData: &Data{
-			ClusterID: uint64(uint64(rand.Int63())),
+			ClusterID: uint64(rand.Int63()),
 			Index:     1,
+			DefaultRetentionPolicyName: config.DefaultRetentionPolicyName,
 		},
 		closing:             make(chan struct{}),
 		changed:             make(chan struct{}),
-		logger:              log.New(os.Stderr, "[metaclient] ", log.LstdFlags),
+		logger:              log.New(ioutil.Discard, "[metaclient] ", log.LstdFlags),
 		authCache:           make(map[string]authUser, 0),
 		path:                config.Dir,
 		retentionAutoCreate: config.RetentionAutoCreate,
@@ -151,31 +144,31 @@ func (c *Client) ClusterID() uint64 {
 }
 
 // Database returns info for the requested database.
-func (c *Client) Database(name string) (*DatabaseInfo, error) {
+func (c *Client) Database(name string) *DatabaseInfo {
 	c.mu.RLock()
 	data := c.cacheData.Clone()
 	c.mu.RUnlock()
 
 	for _, d := range data.Databases {
 		if d.Name == name {
-			return &d, nil
+			return &d
 		}
 	}
 
-	return nil, influxdb.ErrDatabaseNotFound(name)
+	return nil
 }
 
 // Databases returns a list of all database infos.
-func (c *Client) Databases() ([]DatabaseInfo, error) {
+func (c *Client) Databases() []DatabaseInfo {
 	c.mu.RLock()
 	data := c.cacheData.Clone()
 	c.mu.RUnlock()
 
 	dbs := data.Databases
 	if dbs == nil {
-		return []DatabaseInfo{}, nil
+		return []DatabaseInfo{}
 	}
-	return dbs, nil
+	return dbs
 }
 
 // CreateDatabase creates a database or returns it if it already exists
@@ -196,12 +189,11 @@ func (c *Client) CreateDatabase(name string) (*DatabaseInfo, error) {
 	// create default retention policy
 	if c.retentionAutoCreate {
 		if err := data.CreateRetentionPolicy(name, &RetentionPolicyInfo{
-			Name:     "default",
 			ReplicaN: 1,
 		}); err != nil {
 			return nil, err
 		}
-		if err := data.SetDefaultRetentionPolicy(name, "default"); err != nil {
+		if err := data.SetDefaultRetentionPolicy(name, ""); err != nil {
 			return nil, err
 		}
 	}
@@ -569,19 +561,19 @@ func (c *Client) AdminUserExists() bool {
 }
 
 func (c *Client) Authenticate(username, password string) (*UserInfo, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	data := c.cacheData.Clone()
-
 	// Find user.
-	userInfo := data.User(username)
+	c.mu.RLock()
+	userInfo := c.cacheData.User(username)
+	c.mu.RUnlock()
 	if userInfo == nil {
 		return nil, ErrUserNotFound
 	}
 
 	// Check the local auth cache first.
-	if au, ok := c.authCache[username]; ok {
+	c.mu.RLock()
+	au, ok := c.authCache[username]
+	c.mu.RUnlock()
+	if ok {
 		// verify the password using the cached salt and hash
 		if bytes.Equal(c.hashWithSalt(au.salt, password), au.hash) {
 			return userInfo, nil
@@ -600,8 +592,9 @@ func (c *Client) Authenticate(username, password string) (*UserInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.mu.Lock()
 	c.authCache[username] = authUser{salt: salt, hash: hashed, bhash: userInfo.Hash}
-
+	c.mu.Unlock()
 	return userInfo, nil
 }
 
@@ -694,11 +687,19 @@ func (c *Client) DropShard(id uint64) error {
 
 // CreateShardGroup creates a shard group on a database and policy for a given timestamp.
 func (c *Client) CreateShardGroup(database, policy string, timestamp time.Time) (*ShardGroupInfo, error) {
+	// Check under a read-lock
+	c.mu.RLock()
+	if sg, _ := c.cacheData.ShardGroupByTimestamp(database, policy, timestamp); sg != nil {
+		c.mu.RUnlock()
+		return sg, nil
+	}
+	c.mu.RUnlock()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Check again under the write lock
 	data := c.cacheData.Clone()
-
 	if sg, _ := data.ShardGroupByTimestamp(database, policy, timestamp); sg != nil {
 		return sg, nil
 	}
@@ -957,10 +958,12 @@ func (c *Client) MarshalBinary() ([]byte, error) {
 	return c.cacheData.MarshalBinary()
 }
 
-func (c *Client) SetLogger(l *log.Logger) {
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (c *Client) SetLogOutput(w io.Writer) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.logger = l
+	c.logger = log.New(w, "[metaclient] ", log.LstdFlags)
 }
 
 func (c *Client) updateAuthCache() {
@@ -1034,14 +1037,6 @@ func (c *Client) Load() error {
 		return err
 	}
 	return nil
-}
-
-type errCommand struct {
-	msg string
-}
-
-func (e errCommand) Error() string {
-	return e.msg
 }
 
 type uint64Slice []uint64

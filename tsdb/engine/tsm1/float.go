@@ -12,7 +12,6 @@ this version.
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"math"
 
 	"github.com/dgryski/go-bits"
@@ -27,6 +26,9 @@ const (
 	// floatCompressedGorilla is a compressed format using the gorilla paper encoding
 	floatCompressedGorilla = 1
 )
+
+// uvnan is the constant returned from math.NaN().
+const uvnan = 0x7FF8000000000001
 
 // FloatEncoder encodes multiple float64s into a byte slice
 type FloatEncoder struct {
@@ -124,15 +126,13 @@ func (s *FloatEncoder) Push(v float64) {
 
 // FloatDecoder decodes a byte slice into multipe float64 values
 type FloatDecoder struct {
-	val float64
+	val uint64
 
 	leading  uint64
 	trailing uint64
 
 	br BitReader
-
-	b       []byte
-	breader bytesReader
+	b  []byte
 
 	first    bool
 	finished bool
@@ -144,8 +144,7 @@ type FloatDecoder struct {
 func (it *FloatDecoder) SetBytes(b []byte) error {
 	// first byte is the compression type.
 	// we currently just have gorilla compression.
-	it.breader = bytesReader{b: b[1:]}
-	it.br.Reset(&it.breader)
+	it.br.Reset(b[1:])
 
 	v, err := it.br.ReadBits(64)
 	if err != nil {
@@ -153,7 +152,7 @@ func (it *FloatDecoder) SetBytes(b []byte) error {
 	}
 
 	// Reset all fields.
-	it.val = math.Float64frombits(v)
+	it.val = v
 	it.leading = 0
 	it.trailing = 0
 	it.b = b
@@ -173,7 +172,7 @@ func (it *FloatDecoder) Next() bool {
 		it.first = false
 
 		// mark as finished if there were no values.
-		if math.IsNaN(it.val) {
+		if it.val == uvnan { // IsNaN
 			it.finished = true
 			return false
 		}
@@ -182,20 +181,29 @@ func (it *FloatDecoder) Next() bool {
 	}
 
 	// read compressed value
-	bit, err := it.br.ReadBit()
-	if err != nil {
+	var bit bool
+	if it.br.CanReadBitFast() {
+		bit = it.br.ReadBitFast()
+	} else if v, err := it.br.ReadBit(); err != nil {
 		it.err = err
 		return false
+	} else {
+		bit = v
 	}
 
 	if !bit {
 		// it.val = it.val
 	} else {
-		bit, err := it.br.ReadBit()
-		if err != nil {
+		var bit bool
+		if it.br.CanReadBitFast() {
+			bit = it.br.ReadBitFast()
+		} else if v, err := it.br.ReadBit(); err != nil {
 			it.err = err
 			return false
+		} else {
+			bit = v
 		}
+
 		if !bit {
 			// reuse leading/trailing zero bits
 			// it.leading, it.trailing = it.leading, it.trailing
@@ -220,51 +228,30 @@ func (it *FloatDecoder) Next() bool {
 			it.trailing = 64 - it.leading - mbits
 		}
 
-		mbits := int(64 - it.leading - it.trailing)
+		mbits := uint(64 - it.leading - it.trailing)
 		bits, err := it.br.ReadBits(mbits)
 		if err != nil {
 			it.err = err
 			return false
 		}
-		vbits := math.Float64bits(it.val)
+
+		vbits := it.val
 		vbits ^= (bits << it.trailing)
 
-		val := math.Float64frombits(vbits)
-		if math.IsNaN(val) {
+		if vbits == uvnan { // IsNaN
 			it.finished = true
 			return false
 		}
-		it.val = val
+		it.val = vbits
 	}
 
 	return true
 }
 
 func (it *FloatDecoder) Values() float64 {
-	return it.val
+	return math.Float64frombits(it.val)
 }
 
 func (it *FloatDecoder) Error() error {
 	return it.err
-}
-
-// bytesReader is a simplified implementation of bytes.Reader.
-// This is added to remove allocations from needing to call bytes.NewReader().
-type bytesReader struct {
-	b []byte
-	i int64
-}
-
-// Read reads the next bytes in to buffer b.
-// Implementation copied from bytes.Reader.Read.
-func (r *bytesReader) Read(b []byte) (n int, err error) {
-	if len(b) == 0 {
-		return 0, nil
-	}
-	if r.i >= int64(len(r.b)) {
-		return 0, io.EOF
-	}
-	n = copy(b, r.b[r.i:])
-	r.i += int64(n)
-	return
 }

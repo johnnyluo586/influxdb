@@ -2,8 +2,8 @@ package httpd // import "github.com/influxdata/influxdb/services/httpd"
 
 import (
 	"crypto/tls"
-	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/influxdata/influxdb"
+	"github.com/influxdata/influxdb/models"
 )
 
 // statistics gathered by the httpd package.
@@ -31,6 +31,9 @@ const (
 	statQueryRequestDuration         = "queryReqDurationNs" // Number of (wall-time) nanoseconds spent inside query requests
 	statWriteRequestDuration         = "writeReqDurationNs" // Number of (wall-time) nanoseconds spent inside write requests
 	statRequestsActive               = "reqActive"          // Number of currently active requests
+	statWriteRequestsActive          = "writeReqActive"     // Number of currently active write requests
+	statClientError                  = "clientError"        // Number of HTTP responses due to client error
+	statServerError                  = "serverError"        // Number of HTTP responses due to server error
 )
 
 // Service manages the listener and handler for an HTTP endpoint.
@@ -39,35 +42,29 @@ type Service struct {
 	addr  string
 	https bool
 	cert  string
+	key   string
+	limit int
 	err   chan error
 
 	Handler *Handler
 
-	Logger  *log.Logger
-	statMap *expvar.Map
+	Logger *log.Logger
 }
 
 // NewService returns a new instance of Service.
 func NewService(c Config) *Service {
-	// Configure expvar monitoring. It's OK to do this even if the service fails to open and
-	// should be done before any data could arrive for the service.
-	key := strings.Join([]string{"httpd", c.BindAddress}, ":")
-	tags := map[string]string{"bind": c.BindAddress}
-	statMap := influxdb.NewStatistics(key, "httpd", tags)
-
 	s := &Service{
-		addr:  c.BindAddress,
-		https: c.HTTPSEnabled,
-		cert:  c.HTTPSCertificate,
-		err:   make(chan error),
-		Handler: NewHandler(
-			c.AuthEnabled,
-			c.LogEnabled,
-			c.WriteTracing,
-			c.MaxRowLimit,
-			statMap,
-		),
-		Logger: log.New(os.Stderr, "[httpd] ", log.LstdFlags),
+		addr:    c.BindAddress,
+		https:   c.HTTPSEnabled,
+		cert:    c.HTTPSCertificate,
+		key:     c.HTTPSPrivateKey,
+		limit:   c.MaxConnectionLimit,
+		err:     make(chan error),
+		Handler: NewHandler(c),
+		Logger:  log.New(os.Stderr, "[httpd] ", log.LstdFlags),
+	}
+	if s.key == "" {
+		s.key = s.cert
 	}
 	s.Handler.Logger = s.Logger
 	return s
@@ -76,11 +73,11 @@ func NewService(c Config) *Service {
 // Open starts the service
 func (s *Service) Open() error {
 	s.Logger.Println("Starting HTTP service")
-	s.Logger.Println("Authentication enabled:", s.Handler.requireAuthentication)
+	s.Logger.Println("Authentication enabled:", s.Handler.Config.AuthEnabled)
 
 	// Open listener.
 	if s.https {
-		cert, err := tls.LoadX509KeyPair(s.cert, s.cert)
+		cert, err := tls.LoadX509KeyPair(s.cert, s.key)
 		if err != nil {
 			return err
 		}
@@ -102,6 +99,11 @@ func (s *Service) Open() error {
 
 		s.Logger.Println("Listening on HTTP:", listener.Addr().String())
 		s.ln = listener
+	}
+
+	// Enforce a connection limit if one has been given.
+	if s.limit > 0 {
+		s.ln = LimitListener(s.ln, s.limit)
 	}
 
 	// wait for the listeners to start
@@ -130,9 +132,12 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	l := log.New(w, "[httpd] ", log.LstdFlags)
 	s.Logger = l
+	s.Handler.Logger = l
 }
 
 // Err returns a channel for fatal errors that occur on the listener.
@@ -144,6 +149,11 @@ func (s *Service) Addr() net.Addr {
 		return s.ln.Addr()
 	}
 	return nil
+}
+
+// Statistics returns statistics for periodic monitoring.
+func (s *Service) Statistics(tags map[string]string) []models.Statistic {
+	return s.Handler.Statistics(models.Tags{"bind": s.addr}.Merge(tags))
 }
 
 // serve serves the handler from the listener.

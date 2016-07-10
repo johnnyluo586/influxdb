@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/influxdata/influxdb/cluster"
+	"github.com/influxdata/influxdb/coordinator"
 	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/services/meta"
@@ -50,7 +50,7 @@ func TestContinuousQueryService_Run(t *testing.T) {
 
 	// Set a callback for ExecuteStatement.
 	s.QueryExecutor.StatementExecutor = &StatementExecutor{
-		ExecuteStatementFn: func(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
+		ExecuteStatementFn: func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
 			callCnt++
 			if callCnt >= expectCallCnt {
 				done <- struct{}{}
@@ -100,10 +100,7 @@ func TestContinuousQueryService_ResampleOptions(t *testing.T) {
 	mc.CreateContinuousQuery("db", "cq", `CREATE CONTINUOUS QUERY cq ON db RESAMPLE EVERY 10s FOR 2m BEGIN SELECT mean(value) INTO cpu_mean FROM cpu GROUP BY time(1m) END`)
 	s.MetaClient = mc
 
-	db, err := s.MetaClient.Database("db")
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := s.MetaClient.Database("db")
 
 	cq, err := NewContinuousQuery(db.Name, &db.ContinuousQueries[0])
 	if err != nil {
@@ -123,7 +120,7 @@ func TestContinuousQueryService_ResampleOptions(t *testing.T) {
 
 	// Set a callback for ExecuteStatement.
 	s.QueryExecutor.StatementExecutor = &StatementExecutor{
-		ExecuteStatementFn: func(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
+		ExecuteStatementFn: func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
 			callCnt++
 			if callCnt >= expectCallCnt {
 				done <- struct{}{}
@@ -187,7 +184,7 @@ func TestContinuousQueryService_EveryHigherThanInterval(t *testing.T) {
 
 	// Set a callback for ExecuteQuery.
 	s.QueryExecutor.StatementExecutor = &StatementExecutor{
-		ExecuteStatementFn: func(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
+		ExecuteStatementFn: func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
 			callCnt++
 			if callCnt >= expectCallCnt {
 				done <- struct{}{}
@@ -242,7 +239,7 @@ func TestContinuousQueryService_NotLeader(t *testing.T) {
 	done := make(chan struct{})
 	// Set a callback for ExecuteStatement. Shouldn't get called because we're not the leader.
 	s.QueryExecutor.StatementExecutor = &StatementExecutor{
-		ExecuteStatementFn: func(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
+		ExecuteStatementFn: func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
 			done <- struct{}{}
 			ctx.Results <- &influxql.Result{Err: errUnexpected}
 			return nil
@@ -269,7 +266,7 @@ func TestContinuousQueryService_MetaClientFailsToGetDatabases(t *testing.T) {
 	done := make(chan struct{})
 	// Set ExecuteQuery callback, which shouldn't get called because of meta store failure.
 	s.QueryExecutor.StatementExecutor = &StatementExecutor{
-		ExecuteStatementFn: func(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
+		ExecuteStatementFn: func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
 			done <- struct{}{}
 			ctx.Results <- &influxql.Result{Err: errUnexpected}
 			return nil
@@ -290,11 +287,11 @@ func TestContinuousQueryService_MetaClientFailsToGetDatabases(t *testing.T) {
 func TestExecuteContinuousQuery_InvalidQueries(t *testing.T) {
 	s := NewTestService(t)
 	s.QueryExecutor.StatementExecutor = &StatementExecutor{
-		ExecuteStatementFn: func(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
+		ExecuteStatementFn: func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
 			return errUnexpected
 		},
 	}
-	dbis, _ := s.MetaClient.Databases()
+	dbis := s.MetaClient.Databases()
 	dbi := dbis[0]
 	cqi := dbi.ContinuousQueries[0]
 
@@ -323,12 +320,12 @@ func TestExecuteContinuousQuery_InvalidQueries(t *testing.T) {
 func TestExecuteContinuousQuery_QueryExecutor_Error(t *testing.T) {
 	s := NewTestService(t)
 	s.QueryExecutor.StatementExecutor = &StatementExecutor{
-		ExecuteStatementFn: func(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
+		ExecuteStatementFn: func(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
 			return errExpected
 		},
 	}
 
-	dbis, _ := s.MetaClient.Databases()
+	dbis := s.MetaClient.Databases()
 	dbi := dbis[0]
 	cqi := dbi.ContinuousQueries[0]
 
@@ -398,30 +395,30 @@ func (ms *MetaClient) AcquireLease(name string) (l *meta.Lease, err error) {
 	return nil, meta.ErrServiceUnavailable
 }
 
-// Databases returns a list of database info about each database in the cluster.
-func (ms *MetaClient) Databases() ([]meta.DatabaseInfo, error) {
+// Databases returns a list of database info about each database in the coordinator.
+func (ms *MetaClient) Databases() []meta.DatabaseInfo {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
-	return ms.DatabaseInfos, ms.Err
+	return ms.DatabaseInfos
 }
 
 // Database returns a single database by name.
-func (ms *MetaClient) Database(name string) (*meta.DatabaseInfo, error) {
+func (ms *MetaClient) Database(name string) *meta.DatabaseInfo {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 	return ms.database(name)
 }
 
-func (ms *MetaClient) database(name string) (*meta.DatabaseInfo, error) {
+func (ms *MetaClient) database(name string) *meta.DatabaseInfo {
 	if ms.Err != nil {
-		return nil, ms.Err
+		return nil
 	}
 	for i := range ms.DatabaseInfos {
 		if ms.DatabaseInfos[i].Name == name {
-			return &ms.DatabaseInfos[i], nil
+			return &ms.DatabaseInfos[i]
 		}
 	}
-	return nil, fmt.Errorf("database not found: %s", name)
+	return nil
 }
 
 // CreateDatabase adds a new database to the meta store.
@@ -456,10 +453,8 @@ func (ms *MetaClient) CreateContinuousQuery(database, name, query string) error 
 		return ms.Err
 	}
 
-	dbi, err := ms.database(database)
-	if err != nil {
-		return err
-	} else if dbi == nil {
+	dbi := ms.database(database)
+	if dbi == nil {
 		return fmt.Errorf("database not found: %s", database)
 	}
 
@@ -488,15 +483,11 @@ type QueryExecutor struct {
 
 // StatementExecutor is a mock statement executor.
 type StatementExecutor struct {
-	ExecuteStatementFn func(stmt influxql.Statement, ctx *influxql.ExecutionContext) error
+	ExecuteStatementFn func(stmt influxql.Statement, ctx influxql.ExecutionContext) error
 }
 
-func (e *StatementExecutor) ExecuteStatement(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
+func (e *StatementExecutor) ExecuteStatement(stmt influxql.Statement, ctx influxql.ExecutionContext) error {
 	return e.ExecuteStatementFn(stmt, ctx)
-}
-
-func (e *StatementExecutor) NormalizeStatement(stmt influxql.Statement, database string) error {
-	return nil
 }
 
 // NewQueryExecutor returns a *QueryExecutor.
@@ -511,7 +502,7 @@ func NewQueryExecutor(t *testing.T) *QueryExecutor {
 
 // PointsWriter is a mock points writer.
 type PointsWriter struct {
-	WritePointsFn   func(p *cluster.WritePointsRequest) error
+	WritePointsFn   func(p *coordinator.WritePointsRequest) error
 	Err             error
 	PointsPerSecond int
 	t               *testing.T
@@ -526,7 +517,7 @@ func NewPointsWriter(t *testing.T) *PointsWriter {
 }
 
 // WritePoints mocks writing points.
-func (pw *PointsWriter) WritePoints(p *cluster.WritePointsRequest) error {
+func (pw *PointsWriter) WritePoints(p *coordinator.WritePointsRequest) error {
 	// If the test set a callback, call it.
 	if pw.WritePointsFn != nil {
 		if err := pw.WritePointsFn(p); err != nil {

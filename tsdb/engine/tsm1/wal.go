@@ -3,7 +3,6 @@ package tsm1
 import (
 	"encoding/binary"
 	"errors"
-	"expvar"
 	"fmt"
 	"io"
 	"log"
@@ -14,11 +13,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/snappy"
-	"github.com/influxdata/influxdb"
-	"github.com/influxdata/influxdb/tsdb"
+	"github.com/influxdata/influxdb/models"
 )
 
 const (
@@ -51,11 +50,15 @@ type SegmentInfo struct {
 type WalEntryType byte
 
 const (
-	WriteWALEntryType  WalEntryType = 0x01
-	DeleteWALEntryType WalEntryType = 0x02
+	WriteWALEntryType       WalEntryType = 0x01
+	DeleteWALEntryType      WalEntryType = 0x02
+	DeleteRangeWALEntryType WalEntryType = 0x03
 )
 
-var ErrWALClosed = fmt.Errorf("WAL closed")
+var (
+	ErrWALClosed  = fmt.Errorf("WAL closed")
+	ErrWALCorrupt = fmt.Errorf("corrupted WAL entry")
+)
 
 // Statistics gathered by the WAL.
 const (
@@ -86,11 +89,11 @@ type WAL struct {
 	// LoggingEnabled specifies if detailed logs should be output
 	LoggingEnabled bool
 
-	statMap *expvar.Map
+	// statistics for the WAL
+	stats *WALStatistics
 }
 
 func NewWAL(path string) *WAL {
-	db, rp := tsdb.DecodeStorePath(path)
 	return &WAL{
 		path: path,
 
@@ -99,13 +102,32 @@ func NewWAL(path string) *WAL {
 		SegmentSize: DefaultSegmentSize,
 		logger:      log.New(os.Stderr, "[tsm1wal] ", log.LstdFlags),
 		closing:     make(chan struct{}),
-
-		statMap: influxdb.NewStatistics(
-			"tsm1_wal:"+path,
-			"tsm1_wal",
-			map[string]string{"path": path, "database": db, "retentionPolicy": rp},
-		),
+		stats:       &WALStatistics{},
 	}
+}
+
+// SetLogOutput sets the location that logs are written to. It must not be
+// called after the Open method has been called.
+func (l *WAL) SetLogOutput(w io.Writer) {
+	l.logger = log.New(w, "[tsm1wal] ", log.LstdFlags)
+}
+
+// WALStatistics maintains statistics about the WAL.
+type WALStatistics struct {
+	OldBytes     int64
+	CurrentBytes int64
+}
+
+// Statistics returns statistics for periodic monitoring.
+func (l *WAL) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "tsm1_wal",
+		Tags: tags,
+		Values: map[string]interface{}{
+			statWALOldBytes:     atomic.LoadInt64(&l.stats.OldBytes),
+			statWALCurrentBytes: atomic.LoadInt64(&l.stats.CurrentBytes),
+		},
+	}}
 }
 
 // Path returns the path the log was initialized with.
@@ -164,9 +186,7 @@ func (l *WAL) Open() error {
 
 		totalOldDiskSize += stat.Size()
 	}
-	sizeStat := new(expvar.Int)
-	sizeStat.Set(totalOldDiskSize)
-	l.statMap.Set(statWALOldBytes, sizeStat)
+	atomic.StoreInt64(&l.stats.OldBytes, totalOldDiskSize)
 
 	l.closing = make(chan struct{})
 
@@ -244,9 +264,7 @@ func (l *WAL) Remove(files []string) error {
 
 		totalOldDiskSize += stat.Size()
 	}
-	sizeStat := new(expvar.Int)
-	sizeStat.Set(totalOldDiskSize)
-	l.statMap.Set(statWALOldBytes, sizeStat)
+	atomic.StoreInt64(&l.stats.OldBytes, totalOldDiskSize)
 
 	return nil
 }
@@ -293,9 +311,7 @@ func (l *WAL) writeToLog(entry WALEntry) (int, error) {
 	}
 
 	// Update stats for current segment size
-	curSize := new(expvar.Int)
-	curSize.Set(int64(l.currentSegmentWriter.size))
-	l.statMap.Set(statWALCurrentBytes, curSize)
+	atomic.StoreInt64(&l.stats.CurrentBytes, int64(l.currentSegmentWriter.size))
 
 	l.lastWriteTime = time.Now()
 
@@ -348,6 +364,24 @@ func (l *WAL) Delete(keys []string) (int, error) {
 	return id, nil
 }
 
+// Delete deletes the given keys, returning the segment ID for the operation.
+func (l *WAL) DeleteRange(keys []string, min, max int64) (int, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	entry := &DeleteRangeWALEntry{
+		Keys: keys,
+		Min:  min,
+		Max:  max,
+	}
+
+	id, err := l.writeToLog(entry)
+	if err != nil {
+		return -1, err
+	}
+	return id, nil
+}
+
 // Close will finish any flush that is currently in process and close file handles
 func (l *WAL) Close() error {
 	l.mu.Lock()
@@ -381,7 +415,7 @@ func (l *WAL) newSegmentFile() error {
 		if err := l.currentSegmentWriter.close(); err != nil {
 			return err
 		}
-		l.statMap.Add(statWALOldBytes, int64(l.currentSegmentWriter.size))
+		atomic.StoreInt64(&l.stats.OldBytes, int64(l.currentSegmentWriter.size))
 	}
 
 	fileName := filepath.Join(l.path, fmt.Sprintf("%s%05d.%s", WALFilePrefix, l.currentSegmentID, WALFileExtension))
@@ -392,9 +426,7 @@ func (l *WAL) newSegmentFile() error {
 	l.currentSegmentWriter = NewWALSegmentWriter(fd)
 
 	// Reset the current segment size stat
-	curSize := new(expvar.Int)
-	curSize.Set(0)
-	l.statMap.Set(statWALCurrentBytes, curSize)
+	atomic.StoreInt64(&l.stats.CurrentBytes, 0)
 
 	return nil
 }
@@ -553,10 +585,23 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 		typ := b[i]
 		i++
 
+		if i+2 > len(b) {
+			return ErrWALCorrupt
+		}
+
 		length := int(binary.BigEndian.Uint16(b[i : i+2]))
 		i += 2
+
+		if i+length > len(b) {
+			return ErrWALCorrupt
+		}
+
 		k := string(b[i : i+length])
 		i += length
+
+		if i+4 > len(b) {
+			return ErrWALCorrupt
+		}
 
 		nvals := int(binary.BigEndian.Uint32(b[i : i+4]))
 		i += 4
@@ -585,11 +630,19 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 		}
 
 		for j := 0; j < nvals; j++ {
+			if i+8 > len(b) {
+				return ErrWALCorrupt
+			}
+
 			un := int64(binary.BigEndian.Uint64(b[i : i+8]))
 			i += 8
 
 			switch typ {
 			case float64EntryType:
+				if i+8 > len(b) {
+					return ErrWALCorrupt
+				}
+
 				v := math.Float64frombits((binary.BigEndian.Uint64(b[i : i+8])))
 				i += 8
 				if fv, ok := values[j].(*FloatValue); ok {
@@ -597,6 +650,10 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 					fv.value = v
 				}
 			case integerEntryType:
+				if i+8 > len(b) {
+					return ErrWALCorrupt
+				}
+
 				v := int64(binary.BigEndian.Uint64(b[i : i+8]))
 				i += 8
 				if fv, ok := values[j].(*IntegerValue); ok {
@@ -604,6 +661,10 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 					fv.value = v
 				}
 			case booleanEntryType:
+				if i >= len(b) {
+					return ErrWALCorrupt
+				}
+
 				v := b[i]
 				i += 1
 				if fv, ok := values[j].(*BooleanValue); ok {
@@ -615,12 +676,21 @@ func (w *WriteWALEntry) UnmarshalBinary(b []byte) error {
 					}
 				}
 			case stringEntryType:
+				if i+4 > len(b) {
+					return ErrWALCorrupt
+				}
+
 				length := int(binary.BigEndian.Uint32(b[i : i+4]))
 				if i+length > int(uint32(len(b))) {
-					return fmt.Errorf("corrupted write wall entry")
+					return ErrWALCorrupt
 				}
 
 				i += 4
+
+				if i+length > len(b) {
+					return ErrWALCorrupt
+				}
+
 				v := string(b[i : i+length])
 				i += length
 				if fv, ok := values[j].(*StringValue); ok {
@@ -674,6 +744,70 @@ func (w *DeleteWALEntry) Encode(dst []byte) ([]byte, error) {
 
 func (w *DeleteWALEntry) Type() WalEntryType {
 	return DeleteWALEntryType
+}
+
+// DeleteRangeWALEntry represents the deletion of multiple series.
+type DeleteRangeWALEntry struct {
+	Keys     []string
+	Min, Max int64
+}
+
+func (w *DeleteRangeWALEntry) MarshalBinary() ([]byte, error) {
+	b := make([]byte, defaultBufLen)
+	return w.Encode(b)
+}
+
+func (w *DeleteRangeWALEntry) UnmarshalBinary(b []byte) error {
+	if len(b) < 16 {
+		return ErrWALCorrupt
+	}
+
+	w.Min = int64(binary.BigEndian.Uint64(b[:8]))
+	w.Max = int64(binary.BigEndian.Uint64(b[8:16]))
+
+	i := 16
+	for i < len(b) {
+		if i+4 > len(b) {
+			return ErrWALCorrupt
+		}
+		sz := int(binary.BigEndian.Uint32(b[i : i+4]))
+		i += 4
+
+		if i+sz > len(b) {
+			return ErrWALCorrupt
+		}
+		w.Keys = append(w.Keys, string(b[i:i+sz]))
+		i += sz
+	}
+	return nil
+}
+
+func (w *DeleteRangeWALEntry) Encode(b []byte) ([]byte, error) {
+	sz := 16
+	for _, k := range w.Keys {
+		sz += len(k)
+		sz += 4
+	}
+
+	if len(b) < sz {
+		b = make([]byte, sz)
+	}
+
+	binary.BigEndian.PutUint64(b[:8], uint64(w.Min))
+	binary.BigEndian.PutUint64(b[8:16], uint64(w.Max))
+
+	i := 16
+	for _, k := range w.Keys {
+		binary.BigEndian.PutUint32(b[i:i+4], uint32(len(k)))
+		i += 4
+		i += copy(b[i:], k)
+	}
+
+	return b[:i], nil
+}
+
+func (w *DeleteRangeWALEntry) Type() WalEntryType {
+	return DeleteRangeWALEntryType
 }
 
 // WALSegmentWriter writes WAL segments.
@@ -797,6 +931,8 @@ func (r *WALSegmentReader) Next() bool {
 		}
 	case DeleteWALEntryType:
 		r.entry = &DeleteWALEntry{}
+	case DeleteRangeWALEntryType:
+		r.entry = &DeleteRangeWALEntry{}
 	default:
 		r.err = fmt.Errorf("unknown wal entry type: %v", entryType)
 		return true

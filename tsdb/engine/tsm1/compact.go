@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/influxdata/influxdb/tsdb"
@@ -30,7 +31,12 @@ const (
 	TSMFileExtension        = "tsm"
 )
 
-var errMaxFileExceeded = fmt.Errorf("max file exceeded")
+var (
+	errMaxFileExceeded     = fmt.Errorf("max file exceeded")
+	errSnapshotsDisabled   = fmt.Errorf("snapshots disabled")
+	errCompactionsDisabled = fmt.Errorf("compactions disabled")
+	errCompactionAborted   = fmt.Errorf("compaction aborted")
+)
 
 var (
 	MaxTime = time.Unix(0, math.MaxInt64)
@@ -191,7 +197,7 @@ func (c *DefaultPlanner) PlanLevel(level int) []CompactionGroup {
 	if len(cGroup) < limit {
 		return nil
 	}
-	return []CompactionGroup{cGroup[:limit]}
+	return []CompactionGroup{cGroup}
 
 }
 
@@ -276,8 +282,10 @@ func (c *DefaultPlanner) Plan(lastWrite time.Time) []CompactionGroup {
 			continue
 		}
 
-		// Skip the file if it's over the max size and contains a full block
-		if g.size() > uint64(maxTSMFileSize) && c.FileStore.BlockCount(g.files[0].Path, 1) == tsdb.DefaultMaxPointsPerBlock {
+		// Skip the file if it's over the max size and contains a full block or the generation is split
+		// over multiple files.  In the latter case, that would mean the data in the file spilled over
+		// the 2GB limit.
+		if g.size() > uint64(maxTSMFileSize) && c.FileStore.BlockCount(g.files[0].Path, 1) == tsdb.DefaultMaxPointsPerBlock || g.count() > 1 {
 			start = i + 1
 		}
 
@@ -404,17 +412,49 @@ func (c *DefaultPlanner) findGenerations() tsmGenerations {
 // Compactor merges multiple TSM files into new files or
 // writes a Cache into 1 or more TSM files
 type Compactor struct {
-	Dir    string
-	Cancel chan struct{}
-	Size   int
+	Dir  string
+	Size int
 
 	FileStore interface {
 		NextGeneration() int
 	}
+
+	mu      sync.RWMutex
+	opened  bool
+	closing chan struct{}
+}
+
+func (c *Compactor) Open() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.opened {
+		return
+	}
+
+	c.closing = make(chan struct{})
+	c.opened = true
+}
+
+func (c *Compactor) Close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.opened {
+		return
+	}
+	c.opened = false
+	close(c.closing)
 }
 
 // WriteSnapshot will write a Cache snapshot to a new TSM files.
 func (c *Compactor) WriteSnapshot(cache *Cache) ([]string, error) {
+	c.mu.RLock()
+	opened := c.opened
+	c.mu.RUnlock()
+
+	if !opened {
+		return nil, errSnapshotsDisabled
+	}
+
 	iter := NewCacheKeyIterator(cache, tsdb.DefaultMaxPointsPerBlock)
 	return c.writeNewFiles(c.FileStore.NextGeneration(), 0, iter)
 }
@@ -453,10 +493,7 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 			return nil, err
 		}
 
-		tr, err := NewTSMReaderWithOptions(
-			TSMReaderOptions{
-				MMAPFile: f,
-			})
+		tr, err := NewTSMReader(f)
 		if err != nil {
 			return nil, err
 		}
@@ -478,21 +515,28 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 
 // Compact will write multiple smaller TSM files into 1 or more larger files
 func (c *Compactor) CompactFull(tsmFiles []string) ([]string, error) {
+	c.mu.RLock()
+	opened := c.opened
+	c.mu.RUnlock()
+
+	if !opened {
+		return nil, errCompactionsDisabled
+	}
+
 	return c.compact(false, tsmFiles)
 }
 
 // Compact will write multiple smaller TSM files into 1 or more larger files
 func (c *Compactor) CompactFast(tsmFiles []string) ([]string, error) {
-	return c.compact(true, tsmFiles)
-}
+	c.mu.RLock()
+	opened := c.opened
+	c.mu.RUnlock()
 
-// Clone will return a new compactor that can be used even if the engine is closed
-func (c *Compactor) Clone() *Compactor {
-	return &Compactor{
-		Dir:       c.Dir,
-		FileStore: c.FileStore,
-		Cancel:    c.Cancel,
+	if !opened {
+		return nil, errCompactionsDisabled
 	}
+
+	return c.compact(true, tsmFiles)
 }
 
 // writeNewFiles will write from the iterator into new TSM files, rotating
@@ -511,7 +555,7 @@ func (c *Compactor) writeNewFiles(generation, sequence int, iter KeyIterator) ([
 
 		// We've hit the max file limit and there is more to write.  Create a new file
 		// and continue.
-		if err == errMaxFileExceeded {
+		if err == errMaxFileExceeded || err == ErrMaxBlocksExceeded {
 			files = append(files, fileName)
 			continue
 		} else if err == ErrNoValues {
@@ -561,11 +605,14 @@ func (c *Compactor) write(path string, iter KeyIterator) (err error) {
 	}()
 
 	for iter.Next() {
+		c.mu.RLock()
 		select {
-		case <-c.Cancel:
-			return fmt.Errorf("compaction aborted")
+		case <-c.closing:
+			c.mu.RUnlock()
+			return errCompactionAborted
 		default:
 		}
+		c.mu.RUnlock()
 
 		// Each call to read returns the next sorted key (or the prior one if there are
 		// more values to write).  The size of values will be less than or equal to our
@@ -576,7 +623,12 @@ func (c *Compactor) write(path string, iter KeyIterator) (err error) {
 		}
 
 		// Write the key and value
-		if err := w.WriteBlock(key, minTime, maxTime, block); err != nil {
+		if err := w.WriteBlock(key, minTime, maxTime, block); err == ErrMaxBlocksExceeded {
+			if err := w.WriteIndex(); err != nil {
+				return err
+			}
+			return err
+		} else if err != nil {
 			return err
 		}
 
@@ -643,12 +695,42 @@ type tsmKeyIterator struct {
 	blocks    blocks
 
 	buf []blocks
+
+	// mergeValues are decoded blocks that have been combined
+	mergedValues Values
+
+	// merged are encoded blocks that have been combined or used as is
+	// without decode
+	merged blocks
 }
 
 type block struct {
 	key              string
 	minTime, maxTime int64
 	b                []byte
+	tombstones       []TimeRange
+
+	// readMin, readMax are the timestamps range of values have been
+	// read and encoded from this block.
+	readMin, readMax int64
+}
+
+func (b *block) overlapsTimeRange(min, max int64) bool {
+	return b.minTime <= max && b.maxTime >= min
+}
+
+func (b *block) read() bool {
+	return b.readMin <= b.minTime && b.readMax >= b.maxTime
+}
+
+func (b *block) markRead(min, max int64) {
+	if min < b.readMin {
+		b.readMin = min
+	}
+
+	if max > b.readMax {
+		b.readMax = max
+	}
 }
 
 type blocks []*block
@@ -674,7 +756,6 @@ func NewTSMKeyIterator(size int, fast bool, readers ...*TSMReader) (KeyIterator,
 		readers:   readers,
 		values:    map[string][]Value{},
 		pos:       make([]int, len(readers)),
-		keys:      make([]string, len(readers)),
 		size:      size,
 		iterators: iter,
 		fast:      fast,
@@ -683,11 +764,26 @@ func NewTSMKeyIterator(size int, fast bool, readers ...*TSMReader) (KeyIterator,
 }
 
 func (k *tsmKeyIterator) Next() bool {
-	// If we still have blocks from the last read, slice off the current one
-	// and return
+	// Any merged blocks pending?
+	if len(k.merged) > 0 {
+		k.merged = k.merged[1:]
+		if len(k.merged) > 0 {
+			return true
+		}
+	}
+
+	// Any merged values pending?
+	if len(k.mergedValues) > 0 {
+		k.merge()
+		if len(k.merged) > 0 || len(k.mergedValues) > 0 {
+			return true
+		}
+	}
+
+	// If we still have blocks from the last read, merge them
 	if len(k.blocks) > 0 {
-		k.blocks = k.blocks[1:]
-		if len(k.blocks) > 0 {
+		k.merge()
+		if len(k.merged) > 0 || len(k.mergedValues) > 0 {
 			return true
 		}
 	}
@@ -697,31 +793,42 @@ func (k *tsmKeyIterator) Next() bool {
 		if v == nil {
 			iter := k.iterators[i]
 			if iter.Next() {
-				key, minTime, maxTime, b, err := iter.Read()
+				key, minTime, maxTime, _, b, err := iter.Read()
 				if err != nil {
 					k.err = err
 				}
 
+				// This block may have ranges of time removed from it that would
+				// reduce the block min and max time.
+				tombstones := iter.r.TombstoneRange(key)
 				k.buf[i] = append(k.buf[i], &block{
-					minTime: minTime,
-					maxTime: maxTime,
-					key:     key,
-					b:       b,
+					minTime:    minTime,
+					maxTime:    maxTime,
+					key:        key,
+					b:          b,
+					tombstones: tombstones,
+					readMin:    math.MaxInt64,
+					readMax:    math.MinInt64,
 				})
 
 				blockKey := key
 				for iter.PeekNext() == blockKey {
 					iter.Next()
-					key, minTime, maxTime, b, err := iter.Read()
+					key, minTime, maxTime, _, b, err := iter.Read()
 					if err != nil {
 						k.err = err
 					}
 
+					tombstones := iter.r.TombstoneRange(key)
+
 					k.buf[i] = append(k.buf[i], &block{
-						minTime: minTime,
-						maxTime: maxTime,
-						key:     key,
-						b:       b,
+						minTime:    minTime,
+						maxTime:    maxTime,
+						key:        key,
+						b:          b,
+						tombstones: tombstones,
+						readMin:    math.MaxInt64,
+						readMax:    math.MinInt64,
 					})
 				}
 			}
@@ -740,6 +847,7 @@ func (k *tsmKeyIterator) Next() bool {
 			minKey = b[0].key
 		}
 	}
+	k.key = minKey
 
 	// Now we need to find all blocks that match the min key so we can combine and dedupe
 	// the blocks if necessary
@@ -747,60 +855,112 @@ func (k *tsmKeyIterator) Next() bool {
 		if len(b) == 0 {
 			continue
 		}
-		if b[0].key == minKey {
+		if b[0].key == k.key {
 			k.blocks = append(k.blocks, b...)
 			k.buf[i] = nil
 		}
 	}
 
-	// If we have more than one block, we many need to dedup
-	var dedup bool
-
-	// Only one block, just return early everything after is wasted work
-	if len(k.blocks) == 1 {
-		return true
+	if len(k.blocks) == 0 {
+		return false
 	}
 
-	if len(k.blocks) > 1 {
-		// Quickly scan each block to see if any overlap with the first block, if they overlap then
-		// we need to dedup as there may be duplicate points now
-		for i := 1; i < len(k.blocks); i++ {
-			if k.blocks[i].minTime <= k.blocks[i-1].maxTime {
-				dedup = true
-				break
+	k.merge()
+
+	return len(k.merged) > 0
+}
+
+// merge combines the next set of blocks into merged blocks
+func (k *tsmKeyIterator) merge() {
+	// No blocks left, or pending merged values, we're done
+	if len(k.blocks) == 0 && len(k.merged) == 0 && len(k.mergedValues) == 0 {
+		return
+	}
+
+	dedup := false
+	if len(k.blocks) > 0 {
+		// If we have more than one block or any partially tombstoned blocks, we many need to dedup
+		dedup = len(k.blocks[0].tombstones) > 0
+
+		if len(k.blocks) > 1 {
+			// Quickly scan each block to see if any overlap with the prior block, if they overlap then
+			// we need to dedup as there may be duplicate points now
+			for i := 1; !dedup && i < len(k.blocks); i++ {
+				if k.blocks[i].read() {
+					dedup = true
+					break
+				}
+				if k.blocks[i].minTime <= k.blocks[i-1].maxTime || len(k.blocks[i].tombstones) > 0 {
+					dedup = true
+					break
+				}
 			}
 		}
 	}
-	k.blocks = k.combine(dedup)
 
-	return len(k.blocks) > 0
+	k.merged = k.combine(dedup)
 }
 
 // combine returns a new set of blocks using the current blocks in the buffers.  If dedup
 // is true, all the blocks will be decoded, dedup and sorted in in order.  If dedup is false,
 // only blocks that are smaller than the chunk size will be decoded and combined.
 func (k *tsmKeyIterator) combine(dedup bool) blocks {
-	var decoded Values
 	if dedup {
-		// We have some overlapping blocks so decode all, append in order and then dedup
-		for i := 0; i < len(k.blocks); i++ {
-			v, err := DecodeBlock(k.blocks[i].b, nil)
-			if err != nil {
-				k.err = err
-				return nil
+		for len(k.mergedValues) < k.size && len(k.blocks) > 0 {
+			for len(k.blocks) > 0 && k.blocks[0].read() {
+				k.blocks = k.blocks[1:]
 			}
-			decoded = append(decoded, v...)
+
+			if len(k.blocks) == 0 {
+				break
+			}
+			first := k.blocks[0]
+
+			// We have some overlapping blocks so decode all, append in order and then dedup
+			for i := 0; i < len(k.blocks); i++ {
+				if !k.blocks[i].overlapsTimeRange(first.minTime, first.maxTime) || k.blocks[i].read() {
+					continue
+				}
+
+				v, err := DecodeBlock(k.blocks[i].b, nil)
+				if err != nil {
+					k.err = err
+					return nil
+				}
+
+				// Remove values we already read
+				v = Values(v).Exclude(k.blocks[i].readMin, k.blocks[i].readMax)
+
+				// Filter out only the values for overlapping block
+				v = Values(v).Include(first.minTime, first.maxTime)
+				if len(v) > 0 {
+					// Record that we read a subset of the block
+					k.blocks[i].markRead(v[0].UnixNano(), v[len(v)-1].UnixNano())
+				}
+
+				// Apply each tombstone to the block
+				for _, ts := range k.blocks[i].tombstones {
+					v = Values(v).Exclude(ts.Min, ts.Max)
+				}
+
+				k.mergedValues = k.mergedValues.Merge(v)
+			}
+			k.blocks = k.blocks[1:]
 		}
-		decoded = decoded.Deduplicate()
 
 		// Since we combined multiple blocks, we could have more values than we should put into
 		// a single block.  We need to chunk them up into groups and re-encode them.
-		return k.chunk(nil, decoded)
+		return k.chunk(nil)
 	} else {
 		var chunked blocks
 		var i int
 
 		for i < len(k.blocks) {
+			// skip this block if it's values were already read
+			if k.blocks[i].read() {
+				i++
+				continue
+			}
 			// If we this block is already full, just add it as is
 			if BlockCount(k.blocks[i].b) >= k.size {
 				chunked = append(chunked, k.blocks[i])
@@ -812,6 +972,12 @@ func (k *tsmKeyIterator) combine(dedup bool) blocks {
 
 		if k.fast {
 			for i < len(k.blocks) {
+				// skip this block if it's values were already read
+				if k.blocks[i].read() {
+					i++
+					continue
+				}
+
 				chunked = append(chunked, k.blocks[i])
 				i++
 			}
@@ -819,47 +985,48 @@ func (k *tsmKeyIterator) combine(dedup bool) blocks {
 
 		// If we only have 1 blocks left, just append it as is and avoid decoding/recoding
 		if i == len(k.blocks)-1 {
-			chunked = append(chunked, k.blocks[i])
+			if !k.blocks[i].read() {
+				chunked = append(chunked, k.blocks[i])
+			}
 			i++
 		}
 
 		// The remaining blocks can be combined and we know that they do not overlap and
 		// so we can just append each, sort and re-encode.
-		for i < len(k.blocks) {
+		for i < len(k.blocks) && len(k.mergedValues) < k.size {
+			if k.blocks[i].read() {
+				i++
+				continue
+			}
+
 			v, err := DecodeBlock(k.blocks[i].b, nil)
 			if err != nil {
 				k.err = err
 				return nil
 			}
 
-			decoded = append(decoded, v...)
+			// Apply each tombstone to the block
+			for _, ts := range k.blocks[i].tombstones {
+				v = Values(v).Exclude(ts.Min, ts.Max)
+			}
+
+			k.blocks[i].markRead(k.blocks[i].minTime, k.blocks[i].maxTime)
+
+			k.mergedValues = k.mergedValues.Merge(v)
 			i++
 		}
 
-		sort.Sort(Values(decoded))
-		return k.chunk(chunked, decoded)
+		k.blocks = k.blocks[i:]
+
+		return k.chunk(chunked)
 	}
 }
 
-func (k *tsmKeyIterator) chunk(dst blocks, values []Value) blocks {
-	for len(values) > k.size {
-		cb, err := Values(values[:k.size]).Encode(nil)
-		if err != nil {
-			k.err = err
-			return nil
-		}
+func (k *tsmKeyIterator) chunk(dst blocks) blocks {
+	k.mergedValues.assertOrdered()
 
-		dst = append(dst, &block{
-			minTime: values[0].UnixNano(),
-			maxTime: values[k.size-1].UnixNano(),
-			key:     k.blocks[0].key,
-			b:       cb,
-		})
-		values = values[k.size:]
-	}
-
-	// Re-encode the remaining values into the last block
-	if len(values) > 0 {
+	for len(k.mergedValues) > k.size {
+		values := k.mergedValues[:k.size]
 		cb, err := Values(values).Encode(nil)
 		if err != nil {
 			k.err = err
@@ -869,19 +1036,38 @@ func (k *tsmKeyIterator) chunk(dst blocks, values []Value) blocks {
 		dst = append(dst, &block{
 			minTime: values[0].UnixNano(),
 			maxTime: values[len(values)-1].UnixNano(),
-			key:     k.blocks[0].key,
+			key:     k.key,
 			b:       cb,
 		})
+		k.mergedValues = k.mergedValues[k.size:]
+		return dst
+	}
+
+	// Re-encode the remaining values into the last block
+	if len(k.mergedValues) > 0 {
+		cb, err := Values(k.mergedValues).Encode(nil)
+		if err != nil {
+			k.err = err
+			return nil
+		}
+
+		dst = append(dst, &block{
+			minTime: k.mergedValues[0].UnixNano(),
+			maxTime: k.mergedValues[len(k.mergedValues)-1].UnixNano(),
+			key:     k.key,
+			b:       cb,
+		})
+		k.mergedValues = k.mergedValues[:0]
 	}
 	return dst
 }
 
 func (k *tsmKeyIterator) Read() (string, int64, int64, []byte, error) {
-	if len(k.blocks) == 0 {
+	if len(k.merged) == 0 {
 		return "", 0, 0, nil, k.err
 	}
 
-	block := k.blocks[0]
+	block := k.merged[0]
 	return block.key, block.minTime, block.maxTime, block.b, k.err
 }
 

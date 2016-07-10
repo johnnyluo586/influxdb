@@ -2,6 +2,7 @@ package tsm1_test
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -38,6 +39,17 @@ func TestCompactor_Snapshot(t *testing.T) {
 	}
 
 	files, err := compactor.WriteSnapshot(c)
+	if err == nil {
+		t.Fatalf("expected error writing snapshot: %v", err)
+	}
+	if len(files) > 0 {
+		t.Fatalf("no files should be compacted: got %v", len(files))
+
+	}
+
+	compactor.Open()
+
+	files, err = compactor.WriteSnapshot(c)
 	if err != nil {
 		t.Fatalf("unexpected error writing snapshot: %v", err)
 	}
@@ -48,8 +60,7 @@ func TestCompactor_Snapshot(t *testing.T) {
 
 	r := MustOpenTSMReader(files[0])
 
-	keys := r.Keys()
-	if got, exp := len(keys), 2; got != exp {
+	if got, exp := r.KeyCount(), 2; got != exp {
 		t.Fatalf("keys length mismatch: got %v, exp %v", got, exp)
 	}
 
@@ -111,6 +122,17 @@ func TestCompactor_CompactFull(t *testing.T) {
 	}
 
 	files, err := compactor.CompactFull([]string{f1, f2, f3})
+	if err == nil {
+		t.Fatalf("expected error writing snapshot: %v", err)
+	}
+	if len(files) > 0 {
+		t.Fatalf("no files should be compacted: got %v", len(files))
+
+	}
+
+	compactor.Open()
+
+	files, err = compactor.CompactFull([]string{f1, f2, f3})
 	if err != nil {
 		t.Fatalf("unexpected error writing snapshot: %v", err)
 	}
@@ -140,8 +162,7 @@ func TestCompactor_CompactFull(t *testing.T) {
 
 	r := MustOpenTSMReader(files[0])
 
-	keys := r.Keys()
-	if got, exp := len(keys), 3; got != exp {
+	if got, exp := r.KeyCount(), 3; got != exp {
 		t.Fatalf("keys length mismatch: got %v, exp %v", got, exp)
 	}
 
@@ -200,6 +221,7 @@ func TestCompactor_CompactFull_SkipFullBlocks(t *testing.T) {
 		FileStore: &fakeFileStore{},
 		Size:      2,
 	}
+	compactor.Open()
 
 	files, err := compactor.CompactFull([]string{f1, f2, f3})
 	if err != nil {
@@ -231,8 +253,7 @@ func TestCompactor_CompactFull_SkipFullBlocks(t *testing.T) {
 
 	r := MustOpenTSMReader(files[0])
 
-	keys := r.Keys()
-	if got, exp := len(keys), 1; got != exp {
+	if got, exp := r.KeyCount(), 1; got != exp {
 		t.Fatalf("keys length mismatch: got %v, exp %v", got, exp)
 	}
 
@@ -260,6 +281,391 @@ func TestCompactor_CompactFull_SkipFullBlocks(t *testing.T) {
 
 	if got, exp := len(r.Entries("cpu,host=A#!~#value")), 2; got != exp {
 		t.Fatalf("block count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// Ensures that a full compaction will skip over blocks that have the full
+// range of time contained in the block tombstoned
+func TestCompactor_CompactFull_TombstonedSkipBlock(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// write 3 TSM files with different data and one new point
+	a1 := tsm1.NewValue(1, 1.1)
+	a2 := tsm1.NewValue(2, 1.2)
+	writes := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a1, a2},
+	}
+	f1 := MustWriteTSM(dir, 1, writes)
+
+	ts := tsm1.Tombstoner{
+		Path: f1,
+	}
+	ts.AddRange([]string{"cpu,host=A#!~#value"}, math.MinInt64, math.MaxInt64)
+
+	a3 := tsm1.NewValue(3, 1.3)
+	writes = map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a3},
+	}
+	f2 := MustWriteTSM(dir, 2, writes)
+
+	a4 := tsm1.NewValue(4, 1.4)
+	writes = map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a4},
+	}
+	f3 := MustWriteTSM(dir, 3, writes)
+
+	compactor := &tsm1.Compactor{
+		Dir:       dir,
+		FileStore: &fakeFileStore{},
+		Size:      2,
+	}
+	compactor.Open()
+
+	files, err := compactor.CompactFull([]string{f1, f2, f3})
+	if err != nil {
+		t.Fatalf("unexpected error writing snapshot: %v", err)
+	}
+
+	if got, exp := len(files), 1; got != exp {
+		t.Fatalf("files length mismatch: got %v, exp %v", got, exp)
+	}
+
+	expGen, expSeq, err := tsm1.ParseTSMFileName(f3)
+	if err != nil {
+		t.Fatalf("unexpected error parsing file name: %v", err)
+	}
+	expSeq = expSeq + 1
+
+	gotGen, gotSeq, err := tsm1.ParseTSMFileName(files[0])
+	if err != nil {
+		t.Fatalf("unexpected error parsing file name: %v", err)
+	}
+
+	if gotGen != expGen {
+		t.Fatalf("wrong generation for new file: got %v, exp %v", gotGen, expGen)
+	}
+
+	if gotSeq != expSeq {
+		t.Fatalf("wrong sequence for new file: got %v, exp %v", gotSeq, expSeq)
+	}
+
+	r := MustOpenTSMReader(files[0])
+
+	if got, exp := r.KeyCount(), 1; got != exp {
+		t.Fatalf("keys length mismatch: got %v, exp %v", got, exp)
+	}
+
+	var data = []struct {
+		key    string
+		points []tsm1.Value
+	}{
+		{"cpu,host=A#!~#value", []tsm1.Value{a3, a4}},
+	}
+
+	for _, p := range data {
+		values, err := r.ReadAll(p.key)
+		if err != nil {
+			t.Fatalf("unexpected error reading: %v", err)
+		}
+
+		if got, exp := len(values), len(p.points); got != exp {
+			t.Fatalf("values length mismatch %s: got %v, exp %v", p.key, got, exp)
+		}
+
+		for i, point := range p.points {
+			assertValueEqual(t, values[i], point)
+		}
+	}
+
+	if got, exp := len(r.Entries("cpu,host=A#!~#value")), 1; got != exp {
+		t.Fatalf("block count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// Ensures that a full compaction will decode and combine blocks with
+// partial tombstoned values
+func TestCompactor_CompactFull_TombstonedPartialBlock(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// write 3 TSM files with different data and one new point
+	a1 := tsm1.NewValue(1, 1.1)
+	a2 := tsm1.NewValue(2, 1.2)
+	writes := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a1, a2},
+	}
+	f1 := MustWriteTSM(dir, 1, writes)
+
+	ts := tsm1.Tombstoner{
+		Path: f1,
+	}
+	// a1 should remain after compaction
+	ts.AddRange([]string{"cpu,host=A#!~#value"}, 2, math.MaxInt64)
+
+	a3 := tsm1.NewValue(3, 1.3)
+	writes = map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a3},
+	}
+	f2 := MustWriteTSM(dir, 2, writes)
+
+	a4 := tsm1.NewValue(4, 1.4)
+	writes = map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a4},
+	}
+	f3 := MustWriteTSM(dir, 3, writes)
+
+	compactor := &tsm1.Compactor{
+		Dir:       dir,
+		FileStore: &fakeFileStore{},
+		Size:      2,
+	}
+	compactor.Open()
+
+	files, err := compactor.CompactFull([]string{f1, f2, f3})
+	if err != nil {
+		t.Fatalf("unexpected error writing snapshot: %v", err)
+	}
+
+	if got, exp := len(files), 1; got != exp {
+		t.Fatalf("files length mismatch: got %v, exp %v", got, exp)
+	}
+
+	expGen, expSeq, err := tsm1.ParseTSMFileName(f3)
+	if err != nil {
+		t.Fatalf("unexpected error parsing file name: %v", err)
+	}
+	expSeq = expSeq + 1
+
+	gotGen, gotSeq, err := tsm1.ParseTSMFileName(files[0])
+	if err != nil {
+		t.Fatalf("unexpected error parsing file name: %v", err)
+	}
+
+	if gotGen != expGen {
+		t.Fatalf("wrong generation for new file: got %v, exp %v", gotGen, expGen)
+	}
+
+	if gotSeq != expSeq {
+		t.Fatalf("wrong sequence for new file: got %v, exp %v", gotSeq, expSeq)
+	}
+
+	r := MustOpenTSMReader(files[0])
+
+	if got, exp := r.KeyCount(), 1; got != exp {
+		t.Fatalf("keys length mismatch: got %v, exp %v", got, exp)
+	}
+
+	var data = []struct {
+		key    string
+		points []tsm1.Value
+	}{
+		{"cpu,host=A#!~#value", []tsm1.Value{a1, a3, a4}},
+	}
+
+	for _, p := range data {
+		values, err := r.ReadAll(p.key)
+		if err != nil {
+			t.Fatalf("unexpected error reading: %v", err)
+		}
+
+		if got, exp := len(values), len(p.points); got != exp {
+			t.Fatalf("values length mismatch %s: got %v, exp %v", p.key, got, exp)
+		}
+
+		for i, point := range p.points {
+			assertValueEqual(t, values[i], point)
+		}
+	}
+
+	if got, exp := len(r.Entries("cpu,host=A#!~#value")), 2; got != exp {
+		t.Fatalf("block count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// Ensures that a full compaction will decode and combine blocks with
+// multiple tombstoned ranges within the block e.g. (t1, t2, t3, t4)
+// having t2 and t3 removed
+func TestCompactor_CompactFull_TombstonedMultipleRanges(t *testing.T) {
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// write 3 TSM files with different data and one new point
+	a1 := tsm1.NewValue(1, 1.1)
+	a2 := tsm1.NewValue(2, 1.2)
+	a3 := tsm1.NewValue(3, 1.3)
+	a4 := tsm1.NewValue(4, 1.4)
+
+	writes := map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a1, a2, a3, a4},
+	}
+	f1 := MustWriteTSM(dir, 1, writes)
+
+	ts := tsm1.Tombstoner{
+		Path: f1,
+	}
+	// a1, a3 should remain after compaction
+	ts.AddRange([]string{"cpu,host=A#!~#value"}, 2, 2)
+	ts.AddRange([]string{"cpu,host=A#!~#value"}, 4, 4)
+
+	a5 := tsm1.NewValue(5, 1.5)
+	writes = map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a5},
+	}
+	f2 := MustWriteTSM(dir, 2, writes)
+
+	a6 := tsm1.NewValue(6, 1.6)
+	writes = map[string][]tsm1.Value{
+		"cpu,host=A#!~#value": []tsm1.Value{a6},
+	}
+	f3 := MustWriteTSM(dir, 3, writes)
+
+	compactor := &tsm1.Compactor{
+		Dir:       dir,
+		FileStore: &fakeFileStore{},
+		Size:      2,
+	}
+	compactor.Open()
+
+	files, err := compactor.CompactFull([]string{f1, f2, f3})
+	if err != nil {
+		t.Fatalf("unexpected error writing snapshot: %v", err)
+	}
+
+	if got, exp := len(files), 1; got != exp {
+		t.Fatalf("files length mismatch: got %v, exp %v", got, exp)
+	}
+
+	expGen, expSeq, err := tsm1.ParseTSMFileName(f3)
+	if err != nil {
+		t.Fatalf("unexpected error parsing file name: %v", err)
+	}
+	expSeq = expSeq + 1
+
+	gotGen, gotSeq, err := tsm1.ParseTSMFileName(files[0])
+	if err != nil {
+		t.Fatalf("unexpected error parsing file name: %v", err)
+	}
+
+	if gotGen != expGen {
+		t.Fatalf("wrong generation for new file: got %v, exp %v", gotGen, expGen)
+	}
+
+	if gotSeq != expSeq {
+		t.Fatalf("wrong sequence for new file: got %v, exp %v", gotSeq, expSeq)
+	}
+
+	r := MustOpenTSMReader(files[0])
+
+	if got, exp := r.KeyCount(), 1; got != exp {
+		t.Fatalf("keys length mismatch: got %v, exp %v", got, exp)
+	}
+
+	var data = []struct {
+		key    string
+		points []tsm1.Value
+	}{
+		{"cpu,host=A#!~#value", []tsm1.Value{a1, a3, a5, a6}},
+	}
+
+	for _, p := range data {
+		values, err := r.ReadAll(p.key)
+		if err != nil {
+			t.Fatalf("unexpected error reading: %v", err)
+		}
+
+		if got, exp := len(values), len(p.points); got != exp {
+			t.Fatalf("values length mismatch %s: got %v, exp %v", p.key, got, exp)
+		}
+
+		for i, point := range p.points {
+			assertValueEqual(t, values[i], point)
+		}
+	}
+
+	if got, exp := len(r.Entries("cpu,host=A#!~#value")), 2; got != exp {
+		t.Fatalf("block count mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+// Ensures that a compaction will properly rollover to a new file when the
+// max keys per blocks is exceeded
+func TestCompactor_CompactFull_MaxKeys(t *testing.T) {
+	// This test creates a lot of data and causes timeout failures for these envs
+	if testing.Short() || os.Getenv("CI") != "" || os.Getenv("GORACE") != "" {
+		t.Skip("Skipping max keys compaction test")
+	}
+	dir := MustTempDir()
+	defer os.RemoveAll(dir)
+
+	// write two files where the first contains a single key with the maximum
+	// number of full blocks that can fit in a TSM file
+	f1, f1Name := MustTSMWriter(dir, 1)
+	values := make([]tsm1.Value, 1000)
+	for i := 0; i < 65535; i++ {
+		values = values[:0]
+		for j := 0; j < 1000; j++ {
+			values = append(values, tsm1.NewValue(int64(i*1000+j), int64(1)))
+		}
+		if err := f1.Write("cpu,host=A#!~#value", values); err != nil {
+			t.Fatalf("write tsm f1: %v", err)
+		}
+	}
+	if err := f1.WriteIndex(); err != nil {
+		t.Fatalf("write index f1: %v", err)
+	}
+	f1.Close()
+
+	// Write a new file with 1 block that when compacted would exceed the max
+	// blocks
+	lastTimeStamp := values[len(values)-1].UnixNano()
+	values = values[:0]
+	f2, f2Name := MustTSMWriter(dir, 2)
+	for j := lastTimeStamp; j < lastTimeStamp+1000; j++ {
+		values = append(values, tsm1.NewValue(int64(j), int64(1)))
+	}
+	if err := f2.Write("cpu,host=A#!~#value", values); err != nil {
+		t.Fatalf("write tsm f1: %v", err)
+	}
+
+	if err := f2.WriteIndex(); err != nil {
+		t.Fatalf("write index f2: %v", err)
+	}
+	f2.Close()
+
+	compactor := &tsm1.Compactor{
+		Dir:       dir,
+		FileStore: &fakeFileStore{},
+	}
+	compactor.Open()
+
+	// Compact both files, should get 2 files back
+	files, err := compactor.CompactFull([]string{f1Name, f2Name})
+	if err != nil {
+		t.Fatalf("unexpected error writing snapshot: %v", err)
+	}
+
+	if got, exp := len(files), 2; got != exp {
+		t.Fatalf("files length mismatch: got %v, exp %v", got, exp)
+	}
+
+	expGen, expSeq, err := tsm1.ParseTSMFileName(f2Name)
+	if err != nil {
+		t.Fatalf("unexpected error parsing file name: %v", err)
+	}
+	expSeq = expSeq + 1
+
+	gotGen, gotSeq, err := tsm1.ParseTSMFileName(files[0])
+	if err != nil {
+		t.Fatalf("unexpected error parsing file name: %v", err)
+	}
+
+	if gotGen != expGen {
+		t.Fatalf("wrong generation for new file: got %v, exp %v", gotGen, expGen)
+	}
+
+	if gotSeq != expSeq {
+		t.Fatalf("wrong sequence for new file: got %v, exp %v", gotSeq, expSeq)
 	}
 }
 
@@ -304,58 +710,6 @@ func TestTSMKeyIterator_Single(t *testing.T) {
 			readValues = true
 			assertValueEqual(t, v, v1)
 		}
-	}
-
-	if !readValues {
-		t.Fatalf("failed to read any values")
-	}
-}
-
-// Tests that a single TSM file can be read and iterated over
-func TestTSMKeyIterator_Chunked(t *testing.T) {
-	t.Skip("fixme")
-	dir := MustTempDir()
-	defer os.RemoveAll(dir)
-
-	v0 := tsm1.NewValue(1, 1.1)
-	v1 := tsm1.NewValue(2, 2.1)
-	writes := map[string][]tsm1.Value{
-		"cpu,host=A#!~#value": []tsm1.Value{v0, v1},
-	}
-
-	r := MustTSMReader(dir, 1, writes)
-
-	iter, err := tsm1.NewTSMKeyIterator(1, false, r)
-	if err != nil {
-		t.Fatalf("unexpected error creating WALKeyIterator: %v", err)
-	}
-
-	var readValues bool
-	var chunk int
-	for iter.Next() {
-		key, _, _, block, err := iter.Read()
-		if err != nil {
-			t.Fatalf("unexpected error read: %v", err)
-		}
-
-		values, err := tsm1.DecodeBlock(block, nil)
-		if err != nil {
-			t.Fatalf("unexpected error decode: %v", err)
-		}
-
-		if got, exp := key, "cpu,host=A#!~#value"; got != exp {
-			t.Fatalf("key mismatch: got %v, exp %v", got, exp)
-		}
-
-		if got, exp := len(values), len(writes); got != exp {
-			t.Fatalf("values length mismatch: got %v, exp %v", got, exp)
-		}
-
-		for _, v := range values {
-			readValues = true
-			assertValueEqual(t, v, writes["cpu,host=A#!~#value"][chunk])
-		}
-		chunk++
 	}
 
 	if !readValues {
@@ -1065,6 +1419,78 @@ func TestDefaultPlanner_Plan_CompactsMiddleSteps(t *testing.T) {
 	}
 }
 
+func TestDefaultPlanner_Plan_LargeSets(t *testing.T) {
+	cp := &tsm1.DefaultPlanner{
+		FileStore: &fakeFileStore{
+			PathsFn: func() []tsm1.FileStat {
+				return []tsm1.FileStat{
+					tsm1.FileStat{
+						Path: "000000278-000000006.tsm",
+						Size: 2148340232,
+					},
+					tsm1.FileStat{
+						Path: "000000278-000000007.tsm",
+						Size: 2148356556,
+					},
+					tsm1.FileStat{
+						Path: "000000278-000000008.tsm",
+						Size: 167780181,
+					},
+					tsm1.FileStat{
+						Path: "000000446-000047040.tsm",
+						Size: 2148728539,
+					},
+					tsm1.FileStat{
+						Path: "000000446-000047041.tsm",
+						Size: 701863692,
+					},
+				}
+			},
+		},
+	}
+
+	tsm := cp.Plan(time.Now())
+	if exp, got := 0, len(tsm); got != exp {
+		t.Fatalf("tsm file length mismatch: got %v, exp %v", got, exp)
+	}
+}
+
+func TestDefaultPlanner_Plan_LargeGeneration(t *testing.T) {
+	cp := &tsm1.DefaultPlanner{
+		FileStore: &fakeFileStore{
+			PathsFn: func() []tsm1.FileStat {
+				return []tsm1.FileStat{
+					tsm1.FileStat{
+						Path: "000000278-000000006.tsm",
+						Size: 2148340232,
+					},
+					tsm1.FileStat{
+						Path: "000000278-000000007.tsm",
+						Size: 2148356556,
+					},
+					tsm1.FileStat{
+						Path: "000000278-000000008.tsm",
+						Size: 167780181,
+					},
+					tsm1.FileStat{
+						Path: "000000278-000047040.tsm",
+						Size: 2148728539,
+					},
+					tsm1.FileStat{
+						Path: "000000278-000047041.tsm",
+						Size: 701863692,
+					},
+				}
+			},
+		},
+	}
+
+	tsm := cp.Plan(time.Now())
+	if exp, got := 0, len(tsm); got != exp {
+		t.Fatalf("tsm file length mismatch: got %v, exp %v", got, exp)
+	}
+}
+
 func assertValueEqual(t *testing.T, a, b tsm1.Value) {
 	if got, exp := a.UnixNano(), b.UnixNano(); got != exp {
 		t.Fatalf("time mismatch: got %v, exp %v", got, exp)
@@ -1100,7 +1526,7 @@ func MustWALSegment(dir string, entries []tsm1.WALEntry) *tsm1.WALSegmentReader 
 	return tsm1.NewWALSegmentReader(f)
 }
 
-func MustWriteTSM(dir string, gen int, values map[string][]tsm1.Value) string {
+func MustTSMWriter(dir string, gen int) (tsm1.TSMWriter, string) {
 	f := MustTempFile(dir)
 	oldName := f.Name()
 
@@ -1126,6 +1552,12 @@ func MustWriteTSM(dir string, gen int, values map[string][]tsm1.Value) string {
 		panic(fmt.Sprintf("create TSM writer: %v", err))
 	}
 
+	return w, newName
+}
+
+func MustWriteTSM(dir string, gen int, values map[string][]tsm1.Value) string {
+	w, name := MustTSMWriter(dir, gen)
+
 	for k, v := range values {
 		if err := w.Write(k, v); err != nil {
 			panic(fmt.Sprintf("write TSM value: %v", err))
@@ -1140,7 +1572,7 @@ func MustWriteTSM(dir string, gen int, values map[string][]tsm1.Value) string {
 		panic(fmt.Sprintf("write TSM close: %v", err))
 	}
 
-	return newName
+	return name
 }
 
 func MustTSMReader(dir string, gen int, values map[string][]tsm1.Value) *tsm1.TSMReader {
@@ -1153,10 +1585,7 @@ func MustOpenTSMReader(name string) *tsm1.TSMReader {
 		panic(fmt.Sprintf("open file: %v", err))
 	}
 
-	r, err := tsm1.NewTSMReaderWithOptions(
-		tsm1.TSMReaderOptions{
-			MMAPFile: f,
-		})
+	r, err := tsm1.NewTSMReader(f)
 	if err != nil {
 		panic(fmt.Sprintf("new reader: %v", err))
 	}

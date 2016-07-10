@@ -12,16 +12,14 @@ import (
 func TestConfig_Parse(t *testing.T) {
 	// Parse configuration.
 	var c run.Config
-	if _, err := toml.Decode(`
-join = "foo:123,bar:456"
-
+	if err := c.FromToml(`
 [meta]
 dir = "/tmp/meta"
 
 [data]
 dir = "/tmp/data"
 
-[cluster]
+[coordinator]
 
 [admin]
 bind-address = ":8083"
@@ -61,7 +59,7 @@ enabled = true
 
 [continuous_queries]
 enabled = true
-`, &c); err != nil {
+`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -96,8 +94,6 @@ enabled = true
 		t.Fatalf("unexpected subscriber enabled: %v", c.Subscriber.Enabled)
 	} else if c.ContinuousQuery.Enabled != true {
 		t.Fatalf("unexpected continuous query enabled: %v", c.ContinuousQuery.Enabled)
-	} else if exp, got := "foo:123,bar:456", c.Join; exp != got {
-		t.Fatalf("unexpected join value: got %v, exp %v", got, exp)
 	}
 }
 
@@ -112,7 +108,7 @@ dir = "/tmp/meta"
 [data]
 dir = "/tmp/data"
 
-[cluster]
+[coordinator]
 
 [admin]
 bind-address = ":8083"
@@ -172,6 +168,11 @@ enabled = true
 		t.Fatalf("failed to set env var: %v", err)
 	}
 
+	// uint64 type
+	if err := os.Setenv("INFLUXDB_DATA_CACHE_MAX_MEMORY_SIZE", "1000"); err != nil {
+		t.Fatalf("failed to set env var: %v", err)
+	}
+
 	if err := c.ApplyEnvOverrides(); err != nil {
 		t.Fatalf("failed to apply env overrides: %v", err)
 	}
@@ -194,6 +195,10 @@ enabled = true
 
 	if c.OpenTSDBInputs[0].BindAddress != ":2020" {
 		t.Fatalf("unexpected opentsdb bind address: %s", c.OpenTSDBInputs[0].BindAddress)
+	}
+
+	if c.Data.CacheMaxMemorySize != 1000 {
+		t.Fatalf("unexpected cache max memory size: %v", c.Data.CacheMaxMemorySize)
 	}
 }
 
@@ -231,5 +236,22 @@ enabled = false
 
 	if err := c.Validate(); err == nil {
 		t.Fatalf("got nil, expected error")
+	}
+}
+
+func TestConfig_DeprecatedOptions(t *testing.T) {
+	// Parse configuration.
+	var c run.Config
+	if err := c.FromToml(`
+[cluster]
+max-select-point = 100
+`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Validate configuration.
+	if c.Coordinator.MaxSelectPointN != 100 {
+		t.Fatalf("unexpected coordinator max select points: %d", c.Coordinator.MaxSelectPointN)
+
 	}
 }

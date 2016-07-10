@@ -2,16 +2,17 @@ package continuous_querier // import "github.com/influxdata/influxdb/services/co
 
 import (
 	"errors"
-	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/influxql"
+	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/services/meta"
 )
 
@@ -24,9 +25,8 @@ const (
 
 // Statistics for the CQ service.
 const (
-	statQueryOK       = "queryOk"
-	statQueryFail     = "queryFail"
-	statPointsWritten = "pointsWritten"
+	statQueryOK   = "queryOk"
+	statQueryFail = "queryFail"
 )
 
 // ContinuousQuerier represents a service that executes continuous queries.
@@ -38,8 +38,8 @@ type ContinuousQuerier interface {
 // metaClient is an internal interface to make testing easier.
 type metaClient interface {
 	AcquireLease(name string) (l *meta.Lease, err error)
-	Databases() ([]meta.DatabaseInfo, error)
-	Database(name string) (*meta.DatabaseInfo, error)
+	Databases() []meta.DatabaseInfo
+	Database(name string) *meta.DatabaseInfo
 }
 
 // RunRequest is a request to run one or more CQs.
@@ -74,7 +74,7 @@ type Service struct {
 	RunCh          chan *RunRequest
 	Logger         *log.Logger
 	loggingEnabled bool
-	statMap        *expvar.Map
+	stats          *Statistics
 	// lastRuns maps CQ name to last time it was run.
 	mu       sync.RWMutex
 	lastRuns map[string]time.Time
@@ -89,8 +89,8 @@ func NewService(c Config) *Service {
 		RunInterval:    time.Duration(c.RunInterval),
 		RunCh:          make(chan *RunRequest),
 		loggingEnabled: c.LogEnabled,
-		statMap:        influxdb.NewStatistics("cq", "cq", nil),
 		Logger:         log.New(os.Stderr, "[continuous_querier] ", log.LstdFlags),
+		stats:          &Statistics{},
 		lastRuns:       map[string]time.Time{},
 	}
 
@@ -127,9 +127,28 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[continuous_querier] ", log.LstdFlags)
+}
+
+// Statistics maintains the statistics for the continuous query service.
+type Statistics struct {
+	QueryOK   int64
+	QueryFail int64
+}
+
+// Statistics returns statistics for periodic monitoring.
+func (s *Service) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "cq",
+		Tags: tags,
+		Values: map[string]interface{}{
+			statQueryOK:   atomic.LoadInt64(&s.stats.QueryOK),
+			statQueryFail: atomic.LoadInt64(&s.stats.QueryFail),
+		},
+	}}
 }
 
 // Run runs the specified continuous query, or all CQs if none is specified.
@@ -138,20 +157,14 @@ func (s *Service) Run(database, name string, t time.Time) error {
 
 	if database != "" {
 		// Find the requested database.
-		db, err := s.MetaClient.Database(database)
-		if err != nil {
-			return err
-		} else if db == nil {
+		db := s.MetaClient.Database(database)
+		if db == nil {
 			return influxql.ErrDatabaseNotFound(database)
 		}
 		dbs = append(dbs, *db)
 	} else {
 		// Get all databases.
-		var err error
-		dbs, err = s.MetaClient.Databases()
-		if err != nil {
-			return err
-		}
+		dbs = s.MetaClient.Databases()
 	}
 
 	// Loop through databases.
@@ -207,11 +220,7 @@ func (s *Service) backgroundLoop() {
 // hasContinuousQueries returns true if any CQs exist.
 func (s *Service) hasContinuousQueries() bool {
 	// Get list of all databases.
-	dbs, err := s.MetaClient.Databases()
-	if err != nil {
-		s.Logger.Println("error getting databases")
-		return false
-	}
+	dbs := s.MetaClient.Databases()
 	// Loop through all databases executing CQs.
 	for _, db := range dbs {
 		if len(db.ContinuousQueries) > 0 {
@@ -224,11 +233,7 @@ func (s *Service) hasContinuousQueries() bool {
 // runContinuousQueries gets CQs from the meta store and runs them.
 func (s *Service) runContinuousQueries(req *RunRequest) {
 	// Get list of all databases.
-	dbs, err := s.MetaClient.Databases()
-	if err != nil {
-		s.Logger.Println("error getting databases")
-		return
-	}
+	dbs := s.MetaClient.Databases()
 	// Loop through all databases executing CQs.
 	for _, db := range dbs {
 		// TODO: distribute across nodes
@@ -238,9 +243,9 @@ func (s *Service) runContinuousQueries(req *RunRequest) {
 			}
 			if err := s.ExecuteContinuousQuery(&db, &cq, req.Now); err != nil {
 				s.Logger.Printf("error executing query: %s: err = %s", cq.Query, err)
-				s.statMap.Add(statQueryFail, 1)
+				atomic.AddInt64(&s.stats.QueryFail, 1)
 			} else {
-				s.statMap.Add(statQueryOK, 1)
+				atomic.AddInt64(&s.stats.QueryOK, 1)
 			}
 		}
 	}
@@ -346,7 +351,9 @@ func (s *Service) runContinuousQueryAndWriteResult(cq *ContinuousQuery) error {
 	defer close(closing)
 
 	// Execute the SELECT.
-	ch := s.QueryExecutor.ExecuteQuery(q, cq.Database, NoChunkingSize, closing)
+	ch := s.QueryExecutor.ExecuteQuery(q, influxql.ExecutionOptions{
+		Database: cq.Database,
+	}, closing)
 
 	// There is only one statement, so we will only ever receive one result
 	res, ok := <-ch

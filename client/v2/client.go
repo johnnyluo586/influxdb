@@ -123,6 +123,7 @@ func NewHTTPClient(conf HTTPConfig) (Client, error) {
 			Timeout:   conf.Timeout,
 			Transport: tr,
 		},
+		transport: tr,
 	}, nil
 }
 
@@ -172,6 +173,7 @@ func (c *client) Ping(timeout time.Duration) (time.Duration, string, error) {
 
 // Close releases the client's resources.
 func (c *client) Close() error {
+	c.transport.CloseIdleConnections()
 	return nil
 }
 
@@ -221,6 +223,7 @@ type client struct {
 	password   string
 	useragent  string
 	httpClient *http.Client
+	transport  *http.Transport
 }
 
 type udpclient struct {
@@ -538,7 +541,7 @@ func (c *client) Query(q Query) (*Response, error) {
 	u := c.url
 	u.Path = "query"
 
-	req, err := http.NewRequest("GET", u.String(), nil)
+	req, err := http.NewRequest("POST", u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -573,7 +576,7 @@ func (c *client) Query(q Query) (*Response, error) {
 	}
 	// If we got a valid decode error, send that back
 	if decErr != nil {
-		return nil, decErr
+		return nil, fmt.Errorf("unable to decode json: received status code %d err: %s", resp.StatusCode, decErr)
 	}
 	// If we don't have an error in our json response, and didn't get statusOK
 	// then send back an error

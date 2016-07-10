@@ -5,21 +5,25 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"errors"
-	"expvar"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/pprof"
 	"os"
+	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/bmizerany/pat"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
+	"github.com/influxdata/influxdb/monitor"
 	"github.com/influxdata/influxdb/services/continuous_querier"
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/uuid"
@@ -33,11 +37,18 @@ const (
 	DefaultChunkSize = 10000
 )
 
-// TODO: Standard response headers (see: HeaderHandler)
-// TODO: Compression (see: CompressionHeaderHandler)
+// AuthenticationMethod defines the type of authentication used.
+type AuthenticationMethod int
+
+// Supported authentication methods.
+const (
+	UserAuthentication AuthenticationMethod = iota
+	BearerAuthentication
+)
 
 // TODO: Check HTTP response codes: 400, 401, 403, 409.
 
+// Route specifies how to handle a HTTP verb for a given endpoint.
 type Route struct {
 	Name           string
 	Method         string
@@ -49,21 +60,29 @@ type Route struct {
 
 // Handler represents an HTTP handler for the InfluxDB server.
 type Handler struct {
-	mux                   *pat.PatternServeMux
-	requireAuthentication bool
-	Version               string
+	mux     *pat.PatternServeMux
+	Version string
 
 	MetaClient interface {
-		Database(name string) (*meta.DatabaseInfo, error)
+		Database(name string) *meta.DatabaseInfo
 		Authenticate(username, password string) (ui *meta.UserInfo, err error)
 		Users() []meta.UserInfo
+		User(username string) (*meta.UserInfo, error)
 	}
 
 	QueryAuthorizer interface {
 		AuthorizeQuery(u *meta.UserInfo, query *influxql.Query, database string) error
 	}
 
+	WriteAuthorizer interface {
+		AuthorizeWrite(username, database string) error
+	}
+
 	QueryExecutor *influxql.QueryExecutor
+
+	Monitor interface {
+		Statistics(tags map[string]string) ([]*monitor.Statistic, error)
+	}
 
 	PointsWriter interface {
 		WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
@@ -71,37 +90,38 @@ type Handler struct {
 
 	ContinuousQuerier continuous_querier.ContinuousQuerier
 
-	Logger         *log.Logger
-	loggingEnabled bool // Log every HTTP access.
-	WriteTrace     bool // Detailed logging of write path
-	rowLimit       int
-	statMap        *expvar.Map
+	Config    *Config
+	Logger    *log.Logger
+	CLFLogger *log.Logger
+	stats     *Statistics
 }
 
 // NewHandler returns a new instance of handler with routes.
-func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, rowLimit int, statMap *expvar.Map) *Handler {
+func NewHandler(c Config) *Handler {
 	h := &Handler{
-		mux: pat.New(),
-		requireAuthentication: requireAuthentication,
-		Logger:                log.New(os.Stderr, "[http] ", log.LstdFlags),
-		loggingEnabled:        loggingEnabled,
-		WriteTrace:            writeTrace,
-		rowLimit:              rowLimit,
-		statMap:               statMap,
+		mux:       pat.New(),
+		Config:    &c,
+		Logger:    log.New(os.Stderr, "[httpd] ", log.LstdFlags),
+		CLFLogger: log.New(os.Stderr, "[httpd] ", 0),
+		stats:     &Statistics{},
 	}
 
 	h.AddRoutes([]Route{
 		Route{
 			"query-options", // Satisfy CORS checks.
-			"OPTIONS", "/query", true, true, h.serveOptions,
+			"OPTIONS", "/query", false, true, h.serveOptions,
 		},
 		Route{
 			"query", // Query serving route.
 			"GET", "/query", true, true, h.serveQuery,
 		},
 		Route{
+			"query", // Query serving route.
+			"POST", "/query", true, true, h.serveQuery,
+		},
+		Route{
 			"write-options", // Satisfy CORS checks.
-			"OPTIONS", "/write", true, true, h.serveOptions,
+			"OPTIONS", "/write", false, true, h.serveOptions,
 		},
 		Route{
 			"write", // Data-ingest route.
@@ -109,19 +129,19 @@ func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, rowLimit
 		},
 		Route{ // Ping
 			"ping",
-			"GET", "/ping", true, true, h.servePing,
+			"GET", "/ping", false, true, h.servePing,
 		},
 		Route{ // Ping
 			"ping-head",
-			"HEAD", "/ping", true, true, h.servePing,
+			"HEAD", "/ping", false, true, h.servePing,
 		},
 		Route{ // Ping w/ status
 			"status",
-			"GET", "/status", true, true, h.serveStatus,
+			"GET", "/status", false, true, h.serveStatus,
 		},
 		Route{ // Ping w/ status
 			"status-head",
-			"HEAD", "/status", true, true, h.serveStatus,
+			"HEAD", "/status", false, true, h.serveStatus,
 		},
 		// TODO: (corylanou) remove this and associated code
 		Route{ // Tell data node to run CQs that should be run
@@ -133,16 +153,67 @@ func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, rowLimit
 	return h
 }
 
-// SetRoutes sets the provided routes on the handler.
+// Statistics maintains statistics for the httpd service.
+type Statistics struct {
+	Requests                     int64
+	CQRequests                   int64
+	QueryRequests                int64
+	WriteRequests                int64
+	PingRequests                 int64
+	StatusRequests               int64
+	WriteRequestBytesReceived    int64
+	QueryRequestBytesTransmitted int64
+	PointsWrittenOK              int64
+	PointsWrittenFail            int64
+	AuthenticationFailures       int64
+	RequestDuration              int64
+	QueryRequestDuration         int64
+	WriteRequestDuration         int64
+	ActiveRequests               int64
+	ActiveWriteRequests          int64
+	ClientErrors                 int64
+	ServerErrors                 int64
+}
+
+// Statistics returns statistics for periodic monitoring.
+func (h *Handler) Statistics(tags map[string]string) []models.Statistic {
+	return []models.Statistic{{
+		Name: "httpd",
+		Tags: tags,
+		Values: map[string]interface{}{
+			statRequest:                      atomic.LoadInt64(&h.stats.Requests),
+			statCQRequest:                    atomic.LoadInt64(&h.stats.CQRequests),
+			statQueryRequest:                 atomic.LoadInt64(&h.stats.QueryRequests),
+			statWriteRequest:                 atomic.LoadInt64(&h.stats.WriteRequests),
+			statPingRequest:                  atomic.LoadInt64(&h.stats.PingRequests),
+			statStatusRequest:                atomic.LoadInt64(&h.stats.StatusRequests),
+			statWriteRequestBytesReceived:    atomic.LoadInt64(&h.stats.WriteRequestBytesReceived),
+			statQueryRequestBytesTransmitted: atomic.LoadInt64(&h.stats.QueryRequestBytesTransmitted),
+			statPointsWrittenOK:              atomic.LoadInt64(&h.stats.PointsWrittenOK),
+			statPointsWrittenFail:            atomic.LoadInt64(&h.stats.PointsWrittenFail),
+			statAuthFail:                     atomic.LoadInt64(&h.stats.AuthenticationFailures),
+			statRequestDuration:              atomic.LoadInt64(&h.stats.RequestDuration),
+			statQueryRequestDuration:         atomic.LoadInt64(&h.stats.QueryRequestDuration),
+			statWriteRequestDuration:         atomic.LoadInt64(&h.stats.WriteRequestDuration),
+			statRequestsActive:               atomic.LoadInt64(&h.stats.ActiveRequests),
+			statWriteRequestsActive:          atomic.LoadInt64(&h.stats.ActiveWriteRequests),
+			statClientError:                  atomic.LoadInt64(&h.stats.ClientErrors),
+			statServerError:                  atomic.LoadInt64(&h.stats.ServerErrors),
+		},
+	}}
+}
+
+// AddRoutes sets the provided routes on the handler.
 func (h *Handler) AddRoutes(routes ...Route) {
 	for _, r := range routes {
 		var handler http.Handler
 
-		// If it's a handler func that requires authorization, wrap it in authorization
+		// If it's a handler func that requires authorization, wrap it in authentication
 		if hf, ok := r.HandlerFunc.(func(http.ResponseWriter, *http.Request, *meta.UserInfo)); ok {
-			handler = authenticate(hf, h, h.requireAuthentication)
+			handler = authenticate(hf, h, h.Config.AuthEnabled)
 		}
-		// This is a normal handler signature and does not require authorization
+
+		// This is a normal handler signature and does not require authentication
 		if hf, ok := r.HandlerFunc.(func(http.ResponseWriter, *http.Request)); ok {
 			handler = http.HandlerFunc(hf)
 		}
@@ -150,13 +221,12 @@ func (h *Handler) AddRoutes(routes ...Route) {
 		if r.Gzipped {
 			handler = gzipFilter(handler)
 		}
-		handler = versionHeader(handler, h)
 		handler = cors(handler)
 		handler = requestID(handler)
-		if h.loggingEnabled && r.LoggingEnabled {
-			handler = logging(handler, r.Name, h.Logger)
+		if h.Config.LogEnabled && r.LoggingEnabled {
+			handler = h.logging(handler, r.Name)
 		}
-		handler = recovery(handler, r.Name, h.Logger) // make sure recovery is always last
+		handler = h.recovery(handler, r.Name) // make sure recovery is always last
 
 		h.mux.Add(r.Method, r.Pattern, handler)
 
@@ -165,9 +235,13 @@ func (h *Handler) AddRoutes(routes ...Route) {
 
 // ServeHTTP responds to HTTP request to the handler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.statMap.Add(statRequest, 1)
-	h.statMap.Add(statRequestsActive, 1)
+	atomic.AddInt64(&h.stats.Requests, 1)
+	atomic.AddInt64(&h.stats.ActiveRequests, 1)
+	defer atomic.AddInt64(&h.stats.ActiveRequests, -1)
 	start := time.Now()
+
+	// Add version header to all InfluxDB requests.
+	w.Header().Add("X-Influxdb-Version", h.Version)
 
 	// FIXME(benbjohnson): Add pprof enabled flag.
 	if strings.HasPrefix(r.URL.Path, "/debug/pprof") {
@@ -182,21 +256,32 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			pprof.Index(w, r)
 		}
 	} else if strings.HasPrefix(r.URL.Path, "/debug/vars") {
-		serveExpvar(w, r)
+		h.serveExpvar(w, r)
 	} else {
 		h.mux.ServeHTTP(w, r)
 	}
 
-	h.statMap.Add(statRequestsActive, -1)
-	h.statMap.Add(statRequestDuration, time.Since(start).Nanoseconds())
+	atomic.AddInt64(&h.stats.RequestDuration, time.Since(start).Nanoseconds())
+}
+
+// writeHeader writes the provided status code in the response, and
+// updates relevant http error statistics.
+func (h *Handler) writeHeader(w http.ResponseWriter, code int) {
+	switch code / 100 {
+	case 4:
+		atomic.AddInt64(&h.stats.ClientErrors, 1)
+	case 5:
+		atomic.AddInt64(&h.stats.ServerErrors, 1)
+	}
+	w.WriteHeader(code)
 }
 
 func (h *Handler) serveProcessContinuousQueries(w http.ResponseWriter, r *http.Request, user *meta.UserInfo) {
-	h.statMap.Add(statCQRequest, 1)
+	atomic.AddInt64(&h.stats.CQRequests, 1)
 
 	// If the continuous query service isn't configured, return 404.
 	if h.ContinuousQuerier == nil {
-		w.WriteHeader(http.StatusNotImplemented)
+		h.writeHeader(w, http.StatusNotImplemented)
 		return
 	}
 
@@ -216,7 +301,7 @@ func (h *Handler) serveProcessContinuousQueries(w http.ResponseWriter, r *http.R
 			// Try parsing as an int64 nanosecond timestamp.
 			i, err := strconv.ParseInt(s, 10, 64)
 			if err != nil {
-				w.WriteHeader(http.StatusBadRequest)
+				h.writeHeader(w, http.StatusBadRequest)
 				return
 			}
 			t = time.Unix(0, i)
@@ -225,67 +310,91 @@ func (h *Handler) serveProcessContinuousQueries(w http.ResponseWriter, r *http.R
 
 	// Pass the request to the CQ service.
 	if err := h.ContinuousQuerier.Run(db, name, t); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		h.writeHeader(w, http.StatusBadRequest)
 		return
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	h.writeHeader(w, http.StatusNoContent)
 }
 
 // serveQuery parses an incoming query and, if valid, executes the query.
 func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.UserInfo) {
-	h.statMap.Add(statQueryRequest, 1)
+	atomic.AddInt64(&h.stats.QueryRequests, 1)
 	defer func(start time.Time) {
-		h.statMap.Add(statQueryRequestDuration, time.Since(start).Nanoseconds())
+		atomic.AddInt64(&h.stats.QueryRequestDuration, time.Since(start).Nanoseconds())
 	}(time.Now())
 
-	q := r.URL.Query()
-	pretty := q.Get("pretty") == "true"
+	pretty := r.FormValue("pretty") == "true"
+	nodeID, _ := strconv.ParseUint(r.FormValue("node_id"), 10, 64)
 
-	qp := strings.TrimSpace(q.Get("q"))
+	qp := strings.TrimSpace(r.FormValue("q"))
 	if qp == "" {
-		httpError(w, `missing required parameter "q"`, pretty, http.StatusBadRequest)
+		h.httpError(w, `missing required parameter "q"`, pretty, http.StatusBadRequest)
 		return
 	}
 
-	epoch := strings.TrimSpace(q.Get("epoch"))
+	epoch := strings.TrimSpace(r.FormValue("epoch"))
 
 	p := influxql.NewParser(strings.NewReader(qp))
-	db := q.Get("db")
+	db := r.FormValue("db")
+
+	// Sanitize the request query params so it doesn't show up in the response logger.
+	// Do this before anything else so a parsing error doesn't leak passwords.
+	sanitize(r)
+
+	// Parse the parameters
+	rawParams := r.FormValue("params")
+	if rawParams != "" {
+		var params map[string]interface{}
+		decoder := json.NewDecoder(strings.NewReader(rawParams))
+		decoder.UseNumber()
+		if err := decoder.Decode(&params); err != nil {
+			h.httpError(w, "error parsing query parameters: "+err.Error(), pretty, http.StatusBadRequest)
+			return
+		}
+
+		// Convert json.Number into int64 and float64 values
+		for k, v := range params {
+			if v, ok := v.(json.Number); ok {
+				var err error
+				if strings.Contains(string(v), ".") {
+					params[k], err = v.Float64()
+				} else {
+					params[k], err = v.Int64()
+				}
+
+				if err != nil {
+					h.httpError(w, "error parsing json value: "+err.Error(), pretty, http.StatusBadRequest)
+					return
+				}
+			}
+		}
+		p.SetParams(params)
+	}
 
 	// Parse query from query string.
 	query, err := p.ParseQuery()
 	if err != nil {
-		httpError(w, "error parsing query: "+err.Error(), pretty, http.StatusBadRequest)
+		h.httpError(w, "error parsing query: "+err.Error(), pretty, http.StatusBadRequest)
 		return
 	}
 
-	// Sanitize statements with passwords.
-	for _, s := range query.Statements {
-		switch stmt := s.(type) {
-		case *influxql.CreateUserStatement:
-			sanitize(r, stmt.Password)
-		case *influxql.SetPasswordUserStatement:
-			sanitize(r, stmt.Password)
-		}
-	}
-
 	// Check authorization.
-	if h.requireAuthentication {
+	if h.Config.AuthEnabled {
 		if err := h.QueryAuthorizer.AuthorizeQuery(user, query, db); err != nil {
 			if err, ok := err.(meta.ErrAuthorize); ok {
-				h.Logger.Printf("unauthorized request | user: %q | query: %q | database %q\n", err.User, err.Query.String(), err.Database)
+				h.Logger.Printf("Unauthorized request | user: %q | query: %q | database %q\n", err.User, err.Query.String(), err.Database)
 			}
-			httpError(w, "error authorizing query: "+err.Error(), pretty, http.StatusUnauthorized)
+			h.httpError(w, "error authorizing query: "+err.Error(), pretty, http.StatusForbidden)
 			return
 		}
 	}
 
 	// Parse chunk size. Use default if not provided or unparsable.
-	chunked := (q.Get("chunked") == "true")
+	chunked := (r.FormValue("chunked") == "true")
 	chunkSize := DefaultChunkSize
 	if chunked {
-		if n, err := strconv.ParseInt(q.Get("chunk_size"), 10, 64); err == nil && int(n) > 0 {
+		if n, err := strconv.ParseInt(r.FormValue("chunk_size"), 10, 64); err == nil && int(n) > 0 {
 			chunkSize = int(n)
 		}
 	}
@@ -293,24 +402,41 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 	// Make sure if the client disconnects we signal the query to abort
 	closing := make(chan struct{})
 	if notifier, ok := w.(http.CloseNotifier); ok {
+		// CloseNotify() is not guaranteed to send a notification when the query
+		// is closed. Use this channel to signal that the query is finished to
+		// prevent lingering goroutines that may be stuck.
+		done := make(chan struct{})
+		defer close(done)
+
 		notify := notifier.CloseNotify()
 		go func() {
-			<-notify
-			close(closing)
+			// Wait for either the request to finish
+			// or for the client to disconnect
+			select {
+			case <-done:
+			case <-notify:
+				close(closing)
+			}
 		}()
 	} else {
 		defer close(closing)
 	}
 
 	// Execute query.
-	w.Header().Add("content-type", "application/json")
-	results := h.QueryExecutor.ExecuteQuery(query, db, chunkSize, closing)
+	w.Header().Add("Connection", "close")
+	w.Header().Add("Content-Type", "application/json")
+	results := h.QueryExecutor.ExecuteQuery(query, influxql.ExecutionOptions{
+		Database:  db,
+		ChunkSize: chunkSize,
+		ReadOnly:  r.Method == "GET",
+		NodeID:    nodeID,
+	}, closing)
 
 	// if we're not chunking, this will be the in memory buffer for all results before sending to client
 	resp := Response{Results: make([]*influxql.Result, 0)}
 
 	// Status header is OK once this point is reached.
-	w.WriteHeader(http.StatusOK)
+	h.writeHeader(w, http.StatusOK)
 
 	// pull all results from the channel
 	rows := 0
@@ -333,7 +459,7 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 			if !pretty {
 				w.Write([]byte("\n"))
 			}
-			h.statMap.Add(statQueryRequestBytesTransmitted, int64(n))
+			atomic.AddInt64(&h.stats.QueryRequestBytesTransmitted, int64(n))
 			w.(http.Flusher).Flush()
 			continue
 		}
@@ -343,7 +469,7 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 		// If you want to return more than the default chunk size, then use chunking
 		// to process multiple blobs.
 		rows += len(r.Series)
-		if h.rowLimit > 0 && rows > h.rowLimit {
+		if h.Config.MaxRowLimit > 0 && rows > h.Config.MaxRowLimit {
 			break
 		}
 
@@ -388,47 +514,48 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 	// If it's not chunked we buffered everything in memory, so write it out
 	if !chunked {
 		n, _ := w.Write(MarshalJSON(resp, pretty))
-		h.statMap.Add(statQueryRequestBytesTransmitted, int64(n))
+		atomic.AddInt64(&h.stats.QueryRequestBytesTransmitted, int64(n))
 	}
 }
 
 // serveWrite receives incoming series data in line protocol format and writes it to the database.
 func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.UserInfo) {
-	h.statMap.Add(statWriteRequest, 1)
+	atomic.AddInt64(&h.stats.WriteRequests, 1)
+	atomic.AddInt64(&h.stats.ActiveWriteRequests, 1)
 	defer func(start time.Time) {
-		h.statMap.Add(statWriteRequestDuration, time.Since(start).Nanoseconds())
+		atomic.AddInt64(&h.stats.ActiveWriteRequests, -1)
+		atomic.AddInt64(&h.stats.WriteRequestDuration, time.Since(start).Nanoseconds())
 	}(time.Now())
 
 	database := r.URL.Query().Get("db")
 	if database == "" {
-		resultError(w, influxql.Result{Err: fmt.Errorf("database is required")}, http.StatusBadRequest)
+		h.resultError(w, influxql.Result{Err: fmt.Errorf("database is required")}, http.StatusBadRequest)
 		return
 	}
 
-	if di, err := h.MetaClient.Database(database); err != nil {
-		resultError(w, influxql.Result{Err: fmt.Errorf("metastore database error: %s", err)}, http.StatusInternalServerError)
-		return
-	} else if di == nil {
-		resultError(w, influxql.Result{Err: fmt.Errorf("database not found: %q", database)}, http.StatusNotFound)
+	if di := h.MetaClient.Database(database); di == nil {
+		h.resultError(w, influxql.Result{Err: fmt.Errorf("database not found: %q", database)}, http.StatusNotFound)
 		return
 	}
 
-	if h.requireAuthentication && user == nil {
-		resultError(w, influxql.Result{Err: fmt.Errorf("user is required to write to database %q", database)}, http.StatusUnauthorized)
+	if h.Config.AuthEnabled && user == nil {
+		h.resultError(w, influxql.Result{Err: fmt.Errorf("user is required to write to database %q", database)}, http.StatusForbidden)
 		return
 	}
 
-	if h.requireAuthentication && !user.Authorize(influxql.WritePrivilege, database) {
-		resultError(w, influxql.Result{Err: fmt.Errorf("%q user is not authorized to write to database %q", user.Name, database)}, http.StatusUnauthorized)
-		return
+	if h.Config.AuthEnabled {
+		if err := h.WriteAuthorizer.AuthorizeWrite(user.Name, database); err != nil {
+			h.resultError(w, influxql.Result{Err: fmt.Errorf("%q user is not authorized to write to database %q", user.Name, database)}, http.StatusForbidden)
+			return
+		}
 	}
 
 	// Handle gzip decoding of the body
 	body := r.Body
-	if r.Header.Get("Content-encoding") == "gzip" {
+	if r.Header.Get("Content-Encoding") == "gzip" {
 		b, err := gzip.NewReader(r.Body)
 		if err != nil {
-			resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+			h.resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 			return
 		}
 		defer b.Close()
@@ -447,26 +574,26 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 
 	_, err := buf.ReadFrom(body)
 	if err != nil {
-		if h.WriteTrace {
-			h.Logger.Print("write handler unable to read bytes from request body")
+		if h.Config.WriteTracing {
+			h.Logger.Print("Write handler unable to read bytes from request body")
 		}
-		resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+		h.resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 		return
 	}
-	h.statMap.Add(statWriteRequestBytesReceived, int64(buf.Len()))
+	atomic.AddInt64(&h.stats.WriteRequestBytesReceived, int64(buf.Len()))
 
-	if h.WriteTrace {
-		h.Logger.Printf("write body received by handler: %s", buf.Bytes())
+	if h.Config.WriteTracing {
+		h.Logger.Printf("Write body received by handler: %s", buf.Bytes())
 	}
 
 	points, parseError := models.ParsePointsWithPrecision(buf.Bytes(), time.Now().UTC(), r.URL.Query().Get("precision"))
 	// Not points parsed correctly so return the error now
 	if parseError != nil && len(points) == 0 {
 		if parseError.Error() == "EOF" {
-			w.WriteHeader(http.StatusOK)
+			h.writeHeader(w, http.StatusOK)
 			return
 		}
-		resultError(w, influxql.Result{Err: parseError}, http.StatusBadRequest)
+		h.resultError(w, influxql.Result{Err: parseError}, http.StatusBadRequest)
 		return
 	}
 
@@ -477,49 +604,49 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 		var err error
 		consistency, err = models.ParseConsistencyLevel(level)
 		if err != nil {
-			resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+			h.resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 			return
 		}
 	}
 
 	// Write points.
 	if err := h.PointsWriter.WritePoints(database, r.URL.Query().Get("rp"), consistency, points); influxdb.IsClientError(err) {
-		h.statMap.Add(statPointsWrittenFail, int64(len(points)))
-		resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
+		atomic.AddInt64(&h.stats.PointsWrittenFail, int64(len(points)))
+		h.resultError(w, influxql.Result{Err: err}, http.StatusBadRequest)
 		return
 	} else if err != nil {
-		h.statMap.Add(statPointsWrittenFail, int64(len(points)))
-		resultError(w, influxql.Result{Err: err}, http.StatusInternalServerError)
+		atomic.AddInt64(&h.stats.PointsWrittenFail, int64(len(points)))
+		h.resultError(w, influxql.Result{Err: err}, http.StatusInternalServerError)
 		return
 	} else if parseError != nil {
 		// We wrote some of the points
-		h.statMap.Add(statPointsWrittenOK, int64(len(points)))
+		atomic.AddInt64(&h.stats.PointsWrittenOK, int64(len(points)))
 		// The other points failed to parse which means the client sent invalid line protocol.  We return a 400
 		// response code as well as the lines that failed to parse.
-		resultError(w, influxql.Result{Err: fmt.Errorf("partial write:\n%v", parseError)}, http.StatusBadRequest)
+		h.resultError(w, influxql.Result{Err: fmt.Errorf("partial write:\n%v", parseError)}, http.StatusBadRequest)
 		return
 	}
 
-	h.statMap.Add(statPointsWrittenOK, int64(len(points)))
-	w.WriteHeader(http.StatusNoContent)
+	atomic.AddInt64(&h.stats.PointsWrittenOK, int64(len(points)))
+	h.writeHeader(w, http.StatusNoContent)
 }
 
 // serveOptions returns an empty response to comply with OPTIONS pre-flight requests
 func (h *Handler) serveOptions(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusNoContent)
+	h.writeHeader(w, http.StatusNoContent)
 }
 
 // servePing returns a simple response to let the client know the server is running.
 func (h *Handler) servePing(w http.ResponseWriter, r *http.Request) {
-	h.statMap.Add(statPingRequest, 1)
-	w.WriteHeader(http.StatusNoContent)
+	atomic.AddInt64(&h.stats.PingRequests, 1)
+	h.writeHeader(w, http.StatusNoContent)
 }
 
-// serveStatus has been depricated
+// serveStatus has been deprecated
 func (h *Handler) serveStatus(w http.ResponseWriter, r *http.Request) {
-	h.Logger.Printf("WARNING: /status has been depricated.  Use /ping instead.")
-	h.statMap.Add(statStatusRequest, 1)
-	w.WriteHeader(http.StatusNoContent)
+	h.Logger.Printf("WARNING: /status has been deprecated.  Use /ping instead.")
+	atomic.AddInt64(&h.stats.StatusRequests, 1)
+	h.writeHeader(w, http.StatusNoContent)
 }
 
 // convertToEpoch converts result timestamps from time.Time to the specified epoch.
@@ -564,26 +691,82 @@ func MarshalJSON(v interface{}, pretty bool) []byte {
 	return b
 }
 
-// serveExpvar serves registered expvar information over HTTP.
-func serveExpvar(w http.ResponseWriter, r *http.Request) {
+// serveExpvar serves internal metrics in /debug/vars format over HTTP.
+func (h *Handler) serveExpvar(w http.ResponseWriter, r *http.Request) {
+	// Retrieve statistics from the monitor.
+	stats, err := h.Monitor.Statistics(nil)
+	if err != nil {
+		h.httpError(w, err.Error(), false, http.StatusInternalServerError)
+		return
+	}
+
+	m := make(map[string]*monitor.Statistic)
+	for _, s := range stats {
+		// Very hackily create a unique key.
+		buf := bytes.NewBufferString(s.Name)
+		if path, ok := s.Tags["path"]; ok {
+			fmt.Fprintf(buf, ":%s", path)
+			if id, ok := s.Tags["id"]; ok {
+				fmt.Fprintf(buf, ":%s", id)
+			}
+		} else if bind, ok := s.Tags["bind"]; ok {
+			if proto, ok := s.Tags["proto"]; ok {
+				fmt.Fprintf(buf, ":%s", proto)
+			}
+			fmt.Fprintf(buf, ":%s", bind)
+		} else if database, ok := s.Tags["database"]; ok {
+			fmt.Fprintf(buf, ":%s", database)
+			if rp, ok := s.Tags["retention_policy"]; ok {
+				fmt.Fprintf(buf, ":%s", rp)
+				if name, ok := s.Tags["name"]; ok {
+					fmt.Fprintf(buf, ":%s", name)
+				}
+				if dest, ok := s.Tags["destination"]; ok {
+					fmt.Fprintf(buf, ":%s", dest)
+				}
+			}
+		}
+		key := buf.String()
+
+		m[key] = s
+	}
+
+	// Sort the keys to simulate /debug/vars output.
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	fmt.Fprintf(w, "{\n")
+	fmt.Fprintln(w, "{")
 	first := true
-	expvar.Do(func(kv expvar.KeyValue) {
+	for _, key := range keys {
+		// Marshal this statistic to JSON.
+		out, err := json.Marshal(m[key])
+		if err != nil {
+			continue
+		}
+
 		if !first {
-			fmt.Fprintf(w, ",\n")
+			fmt.Fprintln(w, ",")
 		}
 		first = false
-		fmt.Fprintf(w, "%q: %s", kv.Key, kv.Value)
-	})
-	fmt.Fprintf(w, "\n}\n")
+		fmt.Fprintf(w, "%q: ", key)
+		w.Write(bytes.TrimSpace(out))
+	}
+	fmt.Fprintln(w, "\n}")
 }
 
-// httpError writes an error to the client in a standard format.
-func httpError(w http.ResponseWriter, error string, pretty bool, code int) {
-	w.Header().Add("content-type", "application/json")
-	w.WriteHeader(code)
-
+// h.httpError writes an error to the client in a standard format.
+func (h *Handler) httpError(w http.ResponseWriter, error string, pretty bool, code int) {
+	w.Header().Add("Content-Type", "application/json")
+	if code == http.StatusUnauthorized {
+		// If an unauthorized header will be sent back, add a WWW-Authenticate header
+		// as an authorization challenge.
+		w.Header().Set("WWW-Authenticate", fmt.Sprintf("Basic realm=\"%s\"", h.Config.Realm))
+	}
+	h.writeHeader(w, code)
 	response := Response{Err: errors.New(error)}
 	var b []byte
 	if pretty {
@@ -594,29 +777,61 @@ func httpError(w http.ResponseWriter, error string, pretty bool, code int) {
 	w.Write(b)
 }
 
-func resultError(w http.ResponseWriter, result influxql.Result, code int) {
-	w.Header().Add("content-type", "application/json")
-	w.WriteHeader(code)
+func (h *Handler) resultError(w http.ResponseWriter, result influxql.Result, code int) {
+	w.Header().Add("Content-Type", "application/json")
+	h.writeHeader(w, code)
 	_ = json.NewEncoder(w).Encode(&result)
 }
 
 // Filters and filter helpers
 
-// parseCredentials returns the username and password encoded in
-// a request. The credentials may be present as URL query params, or as
-// a Basic Authentication header.
-// as params: http://127.0.0.1/query?u=username&p=password
-// as basic auth: http://username:password@127.0.0.1
-func parseCredentials(r *http.Request) (string, string, error) {
+type credentials struct {
+	Method   AuthenticationMethod
+	Username string
+	Password string
+	Token    string
+}
+
+// parseCredentials parses a request and returns the authentication credentials.
+// The credentials may be present as URL query params, or as a Basic
+// Authentication header.
+// As params: http://127.0.0.1/query?u=username&p=password
+// As basic auth: http://username:password@127.0.0.1
+// As Bearer token in Authorization header: Bearer <JWT_TOKEN_BLOB>
+func parseCredentials(r *http.Request) (*credentials, error) {
 	q := r.URL.Query()
 
+	// Check for the HTTP Authorization header.
+	if s := r.Header.Get("Authorization"); s != "" {
+		// Check for Bearer token.
+		strs := strings.Split(s, " ")
+		if len(strs) == 2 && strs[0] == "Bearer" {
+			return &credentials{
+				Method: BearerAuthentication,
+				Token:  strs[1],
+			}, nil
+		}
+
+		// Check for basic auth.
+		if u, p, ok := r.BasicAuth(); ok {
+			return &credentials{
+				Method:   UserAuthentication,
+				Username: u,
+				Password: p,
+			}, nil
+		}
+	}
+
+	// Check for username and password in URL params.
 	if u, p := q.Get("u"), q.Get("p"); u != "" && p != "" {
-		return u, p, nil
+		return &credentials{
+			Method:   UserAuthentication,
+			Username: u,
+			Password: p,
+		}, nil
 	}
-	if u, p, ok := r.BasicAuth(); ok {
-		return u, p, nil
-	}
-	return "", "", fmt.Errorf("unable to parse Basic Auth credentials")
+
+	return nil, fmt.Errorf("unable to parse authentication credentials")
 }
 
 // authenticate wraps a handler and ensures that if user credentials are passed in
@@ -636,26 +851,85 @@ func authenticate(inner func(http.ResponseWriter, *http.Request, *meta.UserInfo)
 		// Retrieve user list.
 		uis := h.MetaClient.Users()
 
-		// TODO corylanou: never allow this in the future without users
-		if requireAuthentication && len(uis) > 0 {
-			username, password, err := parseCredentials(r)
-			if err != nil {
-				h.statMap.Add(statAuthFail, 1)
-				httpError(w, err.Error(), false, http.StatusUnauthorized)
-				return
+		// See if admin user exists.
+		adminExists := false
+		for i := range uis {
+			if uis[i].Admin {
+				adminExists = true
+				break
 			}
-			if username == "" {
-				h.statMap.Add(statAuthFail, 1)
-				httpError(w, "username required", false, http.StatusUnauthorized)
+		}
+
+		// TODO corylanou: never allow this in the future without users
+		if requireAuthentication && adminExists {
+			creds, err := parseCredentials(r)
+			if err != nil {
+				atomic.AddInt64(&h.stats.AuthenticationFailures, 1)
+				h.httpError(w, err.Error(), false, http.StatusUnauthorized)
 				return
 			}
 
-			user, err = h.MetaClient.Authenticate(username, password)
-			if err != nil {
-				h.statMap.Add(statAuthFail, 1)
-				httpError(w, err.Error(), false, http.StatusUnauthorized)
-				return
+			switch creds.Method {
+			case UserAuthentication:
+				if creds.Username == "" {
+					atomic.AddInt64(&h.stats.AuthenticationFailures, 1)
+					h.httpError(w, "username required", false, http.StatusUnauthorized)
+					return
+				}
+
+				user, err = h.MetaClient.Authenticate(creds.Username, creds.Password)
+				if err != nil {
+					atomic.AddInt64(&h.stats.AuthenticationFailures, 1)
+					h.httpError(w, "authorization failed", false, http.StatusUnauthorized)
+					return
+				}
+			case BearerAuthentication:
+				keyLookupFn := func(token *jwt.Token) (interface{}, error) {
+					// Check for expected signing method.
+					if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+						return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+					}
+					return []byte(h.Config.SharedSecret), nil
+				}
+
+				// Parse and validate the token.
+				token, err := jwt.Parse(creds.Token, keyLookupFn)
+				if err != nil {
+					h.httpError(w, err.Error(), false, http.StatusUnauthorized)
+					return
+				} else if !token.Valid {
+					h.httpError(w, "invalid token", false, http.StatusUnauthorized)
+					return
+				}
+
+				// Make sure an expiration was set on the token.
+				if exp, ok := token.Claims["exp"].(float64); !ok || exp <= 0.0 {
+					h.httpError(w, "token expiration required", false, http.StatusUnauthorized)
+					return
+				}
+
+				// Get the username from the token.
+				username, ok := token.Claims["username"].(string)
+				if !ok {
+					h.httpError(w, "username in token must be a string", false, http.StatusUnauthorized)
+					return
+				} else if username == "" {
+					h.httpError(w, "token must contain a username", false, http.StatusUnauthorized)
+					return
+				}
+
+				// Lookup user in the metastore.
+				if user, err = h.MetaClient.User(username); err != nil {
+					h.httpError(w, err.Error(), false, http.StatusUnauthorized)
+					return
+				} else if user == nil {
+					h.httpError(w, meta.ErrUserNotFound.Error(), false, http.StatusUnauthorized)
+					return
+				}
+			default:
+				h.httpError(w, "unsupported authentication", false, http.StatusUnauthorized)
 			}
+
 		}
 		inner(w, r, user)
 	})
@@ -664,6 +938,17 @@ func authenticate(inner func(http.ResponseWriter, *http.Request, *meta.UserInfo)
 type gzipResponseWriter struct {
 	io.Writer
 	http.ResponseWriter
+}
+
+// WriteHeader sets the provided code as the response status. If the
+// specified status is 204 No Content, then the Content-Encoding header
+// is removed from the response, to prevent clients expecting gzipped
+// encoded bodies from trying to deflate an empty response.
+func (w gzipResponseWriter) WriteHeader(code int) {
+	if code != http.StatusNoContent {
+		w.Header().Set("Content-Encoding", "gzip")
+	}
+	w.ResponseWriter.WriteHeader(code)
 }
 
 func (w gzipResponseWriter) Write(b []byte) (int, error) {
@@ -685,20 +970,10 @@ func gzipFilter(inner http.Handler) http.Handler {
 			inner.ServeHTTP(w, r)
 			return
 		}
-		w.Header().Set("Content-Encoding", "gzip")
 		gz := gzip.NewWriter(w)
 		defer gz.Close()
 		gzw := gzipResponseWriter{Writer: gz, ResponseWriter: w}
 		inner.ServeHTTP(gzw, r)
-	})
-}
-
-// versionHeader takes a HTTP handler and returns a HTTP handler
-// and adds the X-INFLUXBD-VERSION header to outgoing responses.
-func versionHeader(inner http.Handler, h *Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Add("X-InfluxDB-Version", h.Version)
-		inner.ServeHTTP(w, r)
 	})
 }
 
@@ -750,17 +1025,16 @@ func requestID(inner http.Handler) http.Handler {
 	})
 }
 
-func logging(inner http.Handler, name string, weblog *log.Logger) http.Handler {
+func (h *Handler) logging(inner http.Handler, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		l := &responseLogger{w: w}
 		inner.ServeHTTP(l, r)
-		logLine := buildLogLine(l, r, start)
-		weblog.Println(logLine)
+		h.CLFLogger.Println(buildLogLine(l, r, start))
 	})
 }
 
-func recovery(inner http.Handler, name string, weblog *log.Logger) http.Handler {
+func (h *Handler) recovery(inner http.Handler, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		l := &responseLogger{w: w}
@@ -768,8 +1042,8 @@ func recovery(inner http.Handler, name string, weblog *log.Logger) http.Handler 
 		defer func() {
 			if err := recover(); err != nil {
 				logLine := buildLogLine(l, r, start)
-				logLine = fmt.Sprintf(`%s [panic:%s]`, logLine, err)
-				weblog.Println(logLine)
+				logLine = fmt.Sprintf("%s [panic:%s] %s", logLine, err, debug.Stack())
+				h.Logger.Println(logLine)
 			}
 		}()
 

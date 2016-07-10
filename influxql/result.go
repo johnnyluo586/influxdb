@@ -3,6 +3,7 @@ package influxql
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/influxdata/influxdb/models"
 )
@@ -27,10 +28,29 @@ func (t *TagSet) AddFilter(key string, filter Expr) {
 	t.Filters = append(t.Filters, filter)
 }
 
+func (t *TagSet) Len() int           { return len(t.SeriesKeys) }
+func (t *TagSet) Less(i, j int) bool { return t.SeriesKeys[i] < t.SeriesKeys[j] }
+func (t *TagSet) Swap(i, j int) {
+	t.SeriesKeys[i], t.SeriesKeys[j] = t.SeriesKeys[j], t.SeriesKeys[i]
+	t.Filters[i], t.Filters[j] = t.Filters[j], t.Filters[i]
+}
+
 // Message represents a user-facing message to be included with the result.
 type Message struct {
 	Level string `json:"level"`
 	Text  string `json:"text"`
+}
+
+// ReadOnlyWarning generates a warning message that tells the user the command
+// they are using is being used for writing in a read only context.
+//
+// This is a temporary method while to be used while transitioning to read only
+// operations for issue #6290.
+func ReadOnlyWarning(stmt string) *Message {
+	return &Message{
+		Level: WarningLevel,
+		Text:  fmt.Sprintf("deprecated use of '%s' in a read only context, please use a POST request instead", stmt),
+	}
 }
 
 // Result represents a resultset returned from a single statement.

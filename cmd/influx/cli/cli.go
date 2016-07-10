@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"os/user"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -74,9 +73,9 @@ func New(version string) *CommandLine {
 
 // Run executes the CLI
 func (c *CommandLine) Run() error {
-	// register OS signals for graceful termination
 	if !c.IgnoreSignals {
-		signal.Notify(c.osSignals, os.Kill, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGHUP)
+		// register OS signals for graceful termination
+		signal.Notify(c.osSignals, syscall.SIGINT, syscall.SIGTERM)
 	}
 
 	var promptForPassword bool
@@ -168,10 +167,10 @@ func (c *CommandLine) Run() error {
 
 	c.Version()
 
-	usr, err := user.Current()
-	// Only load/write history if we can get the user
-	if err == nil {
-		c.historyFilePath = filepath.Join(usr.HomeDir, ".influx_history")
+	// Only load/write history if HOME environment variable is set.
+	if homeDir := os.Getenv("HOME"); homeDir != "" {
+		// Attempt to load the history file.
+		c.historyFilePath = filepath.Join(homeDir, ".influx_history")
 		if historyFile, err := os.Open(c.historyFilePath); err == nil {
 			c.Line.ReadHistory(historyFile)
 			historyFile.Close()
@@ -179,10 +178,16 @@ func (c *CommandLine) Run() error {
 	}
 
 	// read from prompt until exit is run
+	return c.mainLoop()
+}
+
+// mainLoop runs the main prompt loop for the CLI.
+func (c *CommandLine) mainLoop() error {
 	for {
 		select {
 		case <-c.osSignals:
-			close(c.Quit)
+			c.exit()
+			return nil
 		case <-c.Quit:
 			c.exit()
 			return nil
@@ -192,7 +197,8 @@ func (c *CommandLine) Run() error {
 				// Instead of die, register that someone exited the program gracefully
 				l = "exit"
 			} else if e != nil {
-				break
+				c.exit()
+				return e
 			}
 			if err := c.ParseCommand(l); err != ErrBlankCommand {
 				c.Line.AppendHistory(l)
@@ -210,7 +216,6 @@ func (c *CommandLine) ParseCommand(cmd string) error {
 	if len(tokens) > 0 {
 		switch tokens[0] {
 		case "exit", "quit":
-			// signal the program to exit
 			close(c.Quit)
 		case "gopher":
 			c.gopher()
@@ -287,6 +292,13 @@ func (c *CommandLine) Connect(cmd string) error {
 		return fmt.Errorf("Failed to connect to %s\n", c.Client.Addr())
 	}
 	c.ServerVersion = v
+	// Update the command with the current connection information
+	if h, p, err := net.SplitHostPort(config.URL.Host); err == nil {
+		c.Host = h
+		if i, err := strconv.Atoi(p); err == nil {
+			c.Port = i
+		}
+	}
 
 	return nil
 }
@@ -332,41 +344,46 @@ func (c *CommandLine) use(cmd string) {
 	}
 	d := args[1]
 
-	// validate if specified database exists
+	// Validate if specified database exists
 	response, err := c.Client.Query(client.Query{Command: "SHOW DATABASES"})
 	if err != nil {
 		fmt.Printf("ERR: %s\n", err)
 		return
-	}
-
-	if err := response.Error(); err != nil {
-		fmt.Printf("ERR: %s\n", err)
-		return
-	}
-
-	// verify the provided database exists
-	databaseExists := func() bool {
-		for _, result := range response.Results {
-			for _, row := range result.Series {
-				if row.Name == "databases" {
-					for _, values := range row.Values {
-						for _, database := range values {
-							if database == d {
-								return true
+	} else if err := response.Error(); err != nil {
+		if c.Username == "" {
+			fmt.Printf("ERR: %s\n", err)
+			return
+		}
+		// TODO(jsternberg): Fix SHOW DATABASES to be user-aware #6397.
+		// If we are unable to run SHOW DATABASES, display a warning and use the
+		// database anyway in case the person doesn't have permission to run the
+		// command, but does have permission to use the database.
+		fmt.Printf("WARN: %s\n", err)
+	} else {
+		// Verify the provided database exists
+		if databaseExists := func() bool {
+			for _, result := range response.Results {
+				for _, row := range result.Series {
+					if row.Name == "databases" {
+						for _, values := range row.Values {
+							for _, database := range values {
+								if database == d {
+									return true
+								}
 							}
 						}
 					}
 				}
 			}
+			return false
+		}(); !databaseExists {
+			fmt.Printf("ERR: Database %s doesn't exist. Run SHOW DATABASES for a list of existing databases.\n", d)
+			return
 		}
-		return false
-	}()
-	if databaseExists {
-		c.Database = d
-		fmt.Printf("Using database %s\n", d)
-	} else {
-		fmt.Printf("ERR: Database %s doesn't exist. Run SHOW DATABASES for a list of existing databases.\n", d)
 	}
+
+	c.Database = d
+	fmt.Printf("Using database %s\n", d)
 }
 
 // SetPrecision sets client precision
@@ -504,7 +521,7 @@ func (c *CommandLine) Insert(stmt string) error {
 		},
 		Database:         c.Database,
 		RetentionPolicy:  c.RetentionPolicy,
-		Precision:        "n",
+		Precision:        c.Precision,
 		WriteConsistency: c.WriteConsistency,
 	})
 	if err != nil {
@@ -608,20 +625,20 @@ func (c *CommandLine) writeCSV(response *client.Response, w io.Writer) {
 }
 
 func (c *CommandLine) writeColumns(response *client.Response, w io.Writer) {
+	// Create a tabbed writer for each result as they won't always line up
+	writer := new(tabwriter.Writer)
+	writer.Init(w, 0, 8, 1, '\t', 0)
+
 	for _, result := range response.Results {
 		// Print out all messages first
 		for _, m := range result.Messages {
 			fmt.Fprintf(w, "%s: %s.\n", m.Level, m.Text)
 		}
-
-		// Create a tabbed writer for each result as they won't always line up
-		w := new(tabwriter.Writer)
-		w.Init(os.Stdout, 0, 8, 1, '\t', 0)
 		csv := c.formatResults(result, "\t")
 		for _, r := range csv {
-			fmt.Fprintln(w, r)
+			fmt.Fprintln(writer, r)
 		}
-		w.Flush()
+		writer.Flush()
 	}
 }
 
@@ -841,7 +858,7 @@ func (c *CommandLine) gopher() {
 
 // Version prints CLI version
 func (c *CommandLine) Version() {
-	fmt.Println("InfluxDB shell " + c.ClientVersion)
+	fmt.Println("InfluxDB shell version:", c.ClientVersion)
 }
 
 func (c *CommandLine) exit() {

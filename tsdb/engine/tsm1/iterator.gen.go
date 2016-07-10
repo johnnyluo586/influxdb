@@ -153,7 +153,7 @@ func newFloatIterator(name string, tags influxql.Tags, opt influxql.IteratorOpti
 }
 
 // Next returns the next point from the iterator.
-func (itr *floatIterator) Next() *influxql.FloatPoint {
+func (itr *floatIterator) Next() (*influxql.FloatPoint, error) {
 	for {
 		seek := tsdb.EOF
 
@@ -176,13 +176,13 @@ func (itr *floatIterator) Next() *influxql.FloatPoint {
 		// Exit if we have no more points or we are outside our time range.
 		if itr.point.Time == tsdb.EOF {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if itr.opt.Ascending && itr.point.Time > itr.opt.EndTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if !itr.opt.Ascending && itr.point.Time < itr.opt.StartTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		}
 
 		// Read from each auxiliary cursor.
@@ -208,7 +208,7 @@ func (itr *floatIterator) Next() *influxql.FloatPoint {
 			itr.copyStats()
 		}
 
-		return &itr.point
+		return &itr.point, nil
 	}
 }
 
@@ -247,24 +247,24 @@ func newFloatLimitIterator(input influxql.FloatIterator, opt influxql.IteratorOp
 func (itr *floatLimitIterator) Stats() influxql.IteratorStats { return itr.input.Stats() }
 func (itr *floatLimitIterator) Close() error                  { return itr.input.Close() }
 
-func (itr *floatLimitIterator) Next() *influxql.FloatPoint {
+func (itr *floatLimitIterator) Next() (*influxql.FloatPoint, error) {
 	for {
 		// Check if we are beyond the limit.
 		if (itr.n - itr.opt.Offset) > itr.opt.Limit {
-			return nil
+			return nil, nil
 		}
 
 		// Read the next point.
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Increment counter.
 		itr.n++
 
 		// Offsets are handled by a higher level iterator so return all points.
-		return p
+		return p, nil
 	}
 }
 
@@ -305,10 +305,9 @@ func newFloatAscendingCursor(seek int64, cacheValues Values, tsmKeyCursor *KeyCu
 		return c.cache.values[i].UnixNano() >= seek
 	})
 
-	c.tsm.tdec = NewTimeDecoder()
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]FloatValue, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.ReadFloatBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.ReadFloatBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -353,7 +352,7 @@ func (c *floatAscendingCursor) nextFloat() (int64, float64) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -380,7 +379,7 @@ func (c *floatAscendingCursor) nextTSM() {
 	c.tsm.pos++
 	if c.tsm.pos >= len(c.tsm.values) {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.ReadFloatBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.ReadFloatBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}
@@ -415,10 +414,9 @@ func newFloatDescendingCursor(seek int64, cacheValues Values, tsmKeyCursor *KeyC
 		c.cache.pos--
 	}
 
-	c.tsm.tdec = NewTimeDecoder()
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]FloatValue, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.ReadFloatBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.ReadFloatBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -466,7 +464,7 @@ func (c *floatDescendingCursor) nextFloat() (int64, float64) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -493,7 +491,7 @@ func (c *floatDescendingCursor) nextTSM() {
 	c.tsm.pos--
 	if c.tsm.pos < 0 {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.ReadFloatBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.ReadFloatBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}
@@ -565,7 +563,7 @@ func newIntegerIterator(name string, tags influxql.Tags, opt influxql.IteratorOp
 }
 
 // Next returns the next point from the iterator.
-func (itr *integerIterator) Next() *influxql.IntegerPoint {
+func (itr *integerIterator) Next() (*influxql.IntegerPoint, error) {
 	for {
 		seek := tsdb.EOF
 
@@ -588,13 +586,13 @@ func (itr *integerIterator) Next() *influxql.IntegerPoint {
 		// Exit if we have no more points or we are outside our time range.
 		if itr.point.Time == tsdb.EOF {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if itr.opt.Ascending && itr.point.Time > itr.opt.EndTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if !itr.opt.Ascending && itr.point.Time < itr.opt.StartTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		}
 
 		// Read from each auxiliary cursor.
@@ -620,7 +618,7 @@ func (itr *integerIterator) Next() *influxql.IntegerPoint {
 			itr.copyStats()
 		}
 
-		return &itr.point
+		return &itr.point, nil
 	}
 }
 
@@ -659,24 +657,24 @@ func newIntegerLimitIterator(input influxql.IntegerIterator, opt influxql.Iterat
 func (itr *integerLimitIterator) Stats() influxql.IteratorStats { return itr.input.Stats() }
 func (itr *integerLimitIterator) Close() error                  { return itr.input.Close() }
 
-func (itr *integerLimitIterator) Next() *influxql.IntegerPoint {
+func (itr *integerLimitIterator) Next() (*influxql.IntegerPoint, error) {
 	for {
 		// Check if we are beyond the limit.
 		if (itr.n - itr.opt.Offset) > itr.opt.Limit {
-			return nil
+			return nil, nil
 		}
 
 		// Read the next point.
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Increment counter.
 		itr.n++
 
 		// Offsets are handled by a higher level iterator so return all points.
-		return p
+		return p, nil
 	}
 }
 
@@ -717,10 +715,9 @@ func newIntegerAscendingCursor(seek int64, cacheValues Values, tsmKeyCursor *Key
 		return c.cache.values[i].UnixNano() >= seek
 	})
 
-	c.tsm.tdec = NewTimeDecoder()
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]IntegerValue, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -765,7 +762,7 @@ func (c *integerAscendingCursor) nextInteger() (int64, int64) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -792,7 +789,7 @@ func (c *integerAscendingCursor) nextTSM() {
 	c.tsm.pos++
 	if c.tsm.pos >= len(c.tsm.values) {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}
@@ -827,10 +824,9 @@ func newIntegerDescendingCursor(seek int64, cacheValues Values, tsmKeyCursor *Ke
 		c.cache.pos--
 	}
 
-	c.tsm.tdec = NewTimeDecoder()
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]IntegerValue, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -878,7 +874,7 @@ func (c *integerDescendingCursor) nextInteger() (int64, int64) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -905,7 +901,7 @@ func (c *integerDescendingCursor) nextTSM() {
 	c.tsm.pos--
 	if c.tsm.pos < 0 {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.ReadIntegerBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}
@@ -977,7 +973,7 @@ func newStringIterator(name string, tags influxql.Tags, opt influxql.IteratorOpt
 }
 
 // Next returns the next point from the iterator.
-func (itr *stringIterator) Next() *influxql.StringPoint {
+func (itr *stringIterator) Next() (*influxql.StringPoint, error) {
 	for {
 		seek := tsdb.EOF
 
@@ -1000,13 +996,13 @@ func (itr *stringIterator) Next() *influxql.StringPoint {
 		// Exit if we have no more points or we are outside our time range.
 		if itr.point.Time == tsdb.EOF {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if itr.opt.Ascending && itr.point.Time > itr.opt.EndTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if !itr.opt.Ascending && itr.point.Time < itr.opt.StartTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		}
 
 		// Read from each auxiliary cursor.
@@ -1032,7 +1028,7 @@ func (itr *stringIterator) Next() *influxql.StringPoint {
 			itr.copyStats()
 		}
 
-		return &itr.point
+		return &itr.point, nil
 	}
 }
 
@@ -1071,24 +1067,24 @@ func newStringLimitIterator(input influxql.StringIterator, opt influxql.Iterator
 func (itr *stringLimitIterator) Stats() influxql.IteratorStats { return itr.input.Stats() }
 func (itr *stringLimitIterator) Close() error                  { return itr.input.Close() }
 
-func (itr *stringLimitIterator) Next() *influxql.StringPoint {
+func (itr *stringLimitIterator) Next() (*influxql.StringPoint, error) {
 	for {
 		// Check if we are beyond the limit.
 		if (itr.n - itr.opt.Offset) > itr.opt.Limit {
-			return nil
+			return nil, nil
 		}
 
 		// Read the next point.
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Increment counter.
 		itr.n++
 
 		// Offsets are handled by a higher level iterator so return all points.
-		return p
+		return p, nil
 	}
 }
 
@@ -1129,10 +1125,9 @@ func newStringAscendingCursor(seek int64, cacheValues Values, tsmKeyCursor *KeyC
 		return c.cache.values[i].UnixNano() >= seek
 	})
 
-	c.tsm.tdec = NewTimeDecoder()
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]StringValue, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.ReadStringBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.ReadStringBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -1177,7 +1172,7 @@ func (c *stringAscendingCursor) nextString() (int64, string) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -1204,7 +1199,7 @@ func (c *stringAscendingCursor) nextTSM() {
 	c.tsm.pos++
 	if c.tsm.pos >= len(c.tsm.values) {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.ReadStringBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.ReadStringBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}
@@ -1239,10 +1234,9 @@ func newStringDescendingCursor(seek int64, cacheValues Values, tsmKeyCursor *Key
 		c.cache.pos--
 	}
 
-	c.tsm.tdec = NewTimeDecoder()
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]StringValue, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.ReadStringBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.ReadStringBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -1290,7 +1284,7 @@ func (c *stringDescendingCursor) nextString() (int64, string) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -1317,7 +1311,7 @@ func (c *stringDescendingCursor) nextTSM() {
 	c.tsm.pos--
 	if c.tsm.pos < 0 {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.ReadStringBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.ReadStringBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}
@@ -1389,7 +1383,7 @@ func newBooleanIterator(name string, tags influxql.Tags, opt influxql.IteratorOp
 }
 
 // Next returns the next point from the iterator.
-func (itr *booleanIterator) Next() *influxql.BooleanPoint {
+func (itr *booleanIterator) Next() (*influxql.BooleanPoint, error) {
 	for {
 		seek := tsdb.EOF
 
@@ -1412,13 +1406,13 @@ func (itr *booleanIterator) Next() *influxql.BooleanPoint {
 		// Exit if we have no more points or we are outside our time range.
 		if itr.point.Time == tsdb.EOF {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if itr.opt.Ascending && itr.point.Time > itr.opt.EndTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if !itr.opt.Ascending && itr.point.Time < itr.opt.StartTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		}
 
 		// Read from each auxiliary cursor.
@@ -1444,7 +1438,7 @@ func (itr *booleanIterator) Next() *influxql.BooleanPoint {
 			itr.copyStats()
 		}
 
-		return &itr.point
+		return &itr.point, nil
 	}
 }
 
@@ -1483,24 +1477,24 @@ func newBooleanLimitIterator(input influxql.BooleanIterator, opt influxql.Iterat
 func (itr *booleanLimitIterator) Stats() influxql.IteratorStats { return itr.input.Stats() }
 func (itr *booleanLimitIterator) Close() error                  { return itr.input.Close() }
 
-func (itr *booleanLimitIterator) Next() *influxql.BooleanPoint {
+func (itr *booleanLimitIterator) Next() (*influxql.BooleanPoint, error) {
 	for {
 		// Check if we are beyond the limit.
 		if (itr.n - itr.opt.Offset) > itr.opt.Limit {
-			return nil
+			return nil, nil
 		}
 
 		// Read the next point.
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Increment counter.
 		itr.n++
 
 		// Offsets are handled by a higher level iterator so return all points.
-		return p
+		return p, nil
 	}
 }
 
@@ -1541,10 +1535,9 @@ func newBooleanAscendingCursor(seek int64, cacheValues Values, tsmKeyCursor *Key
 		return c.cache.values[i].UnixNano() >= seek
 	})
 
-	c.tsm.tdec = NewTimeDecoder()
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]BooleanValue, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -1589,7 +1582,7 @@ func (c *booleanAscendingCursor) nextBoolean() (int64, bool) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -1616,7 +1609,7 @@ func (c *booleanAscendingCursor) nextTSM() {
 	c.tsm.pos++
 	if c.tsm.pos >= len(c.tsm.values) {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}
@@ -1651,10 +1644,9 @@ func newBooleanDescendingCursor(seek int64, cacheValues Values, tsmKeyCursor *Ke
 		c.cache.pos--
 	}
 
-	c.tsm.tdec = NewTimeDecoder()
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]BooleanValue, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -1702,7 +1694,7 @@ func (c *booleanDescendingCursor) nextBoolean() (int64, bool) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -1729,7 +1721,7 @@ func (c *booleanDescendingCursor) nextTSM() {
 	c.tsm.pos--
 	if c.tsm.pos < 0 {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanBlock(c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.ReadBooleanBlock(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}

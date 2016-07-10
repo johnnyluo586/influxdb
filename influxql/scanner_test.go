@@ -57,6 +57,8 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `.`, tok: influxql.DOT},
 		{s: `=~`, tok: influxql.EQREGEX},
 		{s: `!~`, tok: influxql.NEQREGEX},
+		{s: `:`, tok: influxql.COLON},
+		{s: `::`, tok: influxql.DOUBLECOLON},
 
 		// Identifiers
 		{s: `foo`, tok: influxql.IDENT, lit: `foo`},
@@ -68,6 +70,8 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `"foo\"bar\""`, tok: influxql.IDENT, lit: `foo"bar"`},
 		{s: `test"`, tok: influxql.BADSTRING, lit: "", pos: influxql.Pos{Line: 0, Char: 3}},
 		{s: `"test`, tok: influxql.BADSTRING, lit: `test`},
+		{s: `$host`, tok: influxql.BOUNDPARAM, lit: `host`},
+		{s: `$"host param"`, tok: influxql.BOUNDPARAM, lit: `host param`},
 
 		{s: `true`, tok: influxql.TRUE},
 		{s: `false`, tok: influxql.FALSE},
@@ -132,7 +136,6 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `GROUP`, tok: influxql.GROUP},
 		{s: `GROUPS`, tok: influxql.GROUPS},
 		{s: `IF`, tok: influxql.IF},
-		{s: `INNER`, tok: influxql.INNER},
 		{s: `INSERT`, tok: influxql.INSERT},
 		{s: `INTO`, tok: influxql.INTO},
 		{s: `KEY`, tok: influxql.KEY},
@@ -161,8 +164,6 @@ func TestScanner_Scan(t *testing.T) {
 		{s: `REVOKE`, tok: influxql.REVOKE},
 		{s: `SELECT`, tok: influxql.SELECT},
 		{s: `SERIES`, tok: influxql.SERIES},
-		{s: `SERVER`, tok: influxql.SERVER},
-		{s: `SERVERS`, tok: influxql.SERVERS},
 		{s: `TAG`, tok: influxql.TAG},
 		{s: `TO`, tok: influxql.TO},
 		{s: `USER`, tok: influxql.USER},

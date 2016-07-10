@@ -1,16 +1,21 @@
 package run
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/user"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/influxdata/influxdb/cluster"
+	"github.com/BurntSushi/toml"
+	"github.com/influxdata/influxdb/coordinator"
 	"github.com/influxdata/influxdb/monitor"
 	"github.com/influxdata/influxdb/services/admin"
 	"github.com/influxdata/influxdb/services/collectd"
@@ -27,21 +32,17 @@ import (
 )
 
 const (
-	// DefaultBindAddress is the default address for raft, cluster, snapshot, etc..
+	// DefaultBindAddress is the default address for various RPC services.
 	DefaultBindAddress = ":8088"
-
-	// DefaultHostname is the default hostname used if we are unable to determine
-	// the hostname from the system
-	DefaultHostname = "localhost"
 )
 
 // Config represents the configuration format for the influxd binary.
 type Config struct {
-	Meta       *meta.Config      `toml:"meta"`
-	Data       tsdb.Config       `toml:"data"`
-	Cluster    cluster.Config    `toml:"cluster"`
-	Retention  retention.Config  `toml:"retention"`
-	Precreator precreator.Config `toml:"shard-precreation"`
+	Meta        *meta.Config       `toml:"meta"`
+	Data        tsdb.Config        `toml:"data"`
+	Coordinator coordinator.Config `toml:"coordinator"`
+	Retention   retention.Config   `toml:"retention"`
+	Precreator  precreator.Config  `toml:"shard-precreation"`
 
 	Admin          admin.Config      `toml:"admin"`
 	Monitor        monitor.Config    `toml:"monitor"`
@@ -59,12 +60,6 @@ type Config struct {
 
 	// BindAddress is the address that all TCP services use (Raft, Snapshot, Cluster, etc.)
 	BindAddress string `toml:"bind-address"`
-
-	// Hostname is the hostname portion to use when registering local
-	// addresses.  This hostname must be resolvable from other nodes.
-	Hostname string `toml:"hostname"`
-
-	Join string `toml:"join"`
 }
 
 // NewConfig returns an instance of Config with reasonable defaults.
@@ -72,7 +67,7 @@ func NewConfig() *Config {
 	c := &Config{}
 	c.Meta = meta.NewConfig()
 	c.Data = tsdb.NewConfig()
-	c.Cluster = cluster.NewConfig()
+	c.Coordinator = coordinator.NewConfig()
 	c.Precreator = precreator.NewConfig()
 
 	c.Admin = admin.NewConfig()
@@ -116,6 +111,38 @@ func NewDemoConfig() (*Config, error) {
 	return c, nil
 }
 
+// trimBOM trims the Byte-Order-Marks from the beginning of the file.
+// this is for Windows compatability only.
+// see https://github.com/influxdata/telegraf/issues/1378
+func trimBOM(f []byte) []byte {
+	return bytes.TrimPrefix(f, []byte("\xef\xbb\xbf"))
+}
+
+// FromTomlFile loads the config from a TOML file.
+func (c *Config) FromTomlFile(fpath string) error {
+	bs, err := ioutil.ReadFile(fpath)
+	if err != nil {
+		return err
+	}
+	bs = trimBOM(bs)
+	return c.FromToml(string(bs))
+}
+
+// FromToml loads the config from TOML.
+func (c *Config) FromToml(input string) error {
+	// Replace deprecated [cluster] with [coordinator]
+	re := regexp.MustCompile(`(?m)^\s*\[cluster\]`)
+	input = re.ReplaceAllStringFunc(input, func(in string) string {
+		in = strings.TrimSpace(in)
+		out := "[coordinator]"
+		log.Printf("deprecated config option %s replaced with %s; %s will not be supported in a future release\n", in, out, in)
+		return out
+	})
+
+	_, err := toml.Decode(input, c)
+	return err
+}
+
 // Validate returns an error if the config is invalid.
 func (c *Config) Validate() error {
 	if err := c.Meta.Validate(); err != nil {
@@ -123,6 +150,14 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.Data.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Monitor.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Subscriber.Validate(); err != nil {
 		return err
 	}
 
@@ -221,6 +256,15 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value) error {
 				}
 
 				f.SetInt(intValue)
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				var intValue uint64
+				var err error
+				intValue, err = strconv.ParseUint(value, 0, f.Type().Bits())
+				if err != nil {
+					return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldKey, f.Type().String(), value)
+				}
+
+				f.SetUint(intValue)
 			case reflect.Bool:
 				boolValue, err := strconv.ParseBool(value)
 				if err != nil {
